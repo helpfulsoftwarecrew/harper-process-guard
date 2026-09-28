@@ -1,0 +1,21 @@
+{
+	// Checks the source; it never compiles it. `noEmit` is the point: what ships is what is written.
+	"compilerOptions": {
+		"target": "ES2022",
+		"module": "NodeNext",
+		"moduleResolution": "NodeNext",
+		// The engines field, not the target: Node 22.18 carries every ES2024 built-in, and a test waits on an Atomic.
+		"lib": ["ES2024"],
+		// TS7 stops auto-including node_modules/@types; without this every `process` reference dies on TS2591.
+		"types": ["node"],
+		"allowJs": true,
+		"checkJs": true,
+		"noEmit": true,
+		"strict": true,
+		"noUncheckedIndexedAccess": true,
+		"exactOptionalPropertyTypes": true,
+		"skipLibCheck": true,
+		"forceConsistentCasingInFileNames": true
+	},
+	"include": ["src/**/*.js", "test/**/*.js"]
+}

@@ -1,0 +1,93 @@
+name: Test
+
+on:
+  # These suites are hermetic (real processes, no network), so every branch runs them; "**" matches branches only, so tag pushes stay with publish.yml.
+  push:
+    branches: ['**']
+  pull_request:
+  workflow_dispatch:
+  # publish.yml runs this workflow whole as its gate, so the publish path cannot drift onto weaker checks.
+  workflow_call:
+
+# Nothing here writes with GITHUB_TOKEN; without this line every job takes the repo default, which can be write-all.
+permissions:
+  contents: read
+
+# A superseded push must not run the six-leg matrix beside its replacement; main never cancels. Via
+# workflow_call the group takes the caller's name, so it never collides with publish.yml's per-ref group.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  test:
+    name: test (${{ matrix.os }}, node ${{ matrix.node }})
+    strategy:
+      fail-fast: false
+      matrix:
+        # Exactly the platforms src/identity.js can read a command line on, and the same set package.json's `os` claims.
+        # Several cases assert different outcomes per platform, so the divergence is the design rather than flake.
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        # Harper v5 declares engines.node "^22.18.0 || >=24.0.0", so 22 and 24 are the two versions that exist in the field.
+        node: ['22', '24']
+    runs-on: ${{ matrix.os }}
+    # Sized against `npm ci` on a cold cache, not the suite, which runs in seconds.
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: ${{ matrix.node }}
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Check formatting
+        run: npm run format:check
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Type check
+        run: npm run typecheck
+
+      # `npm test` is `node --test "test/**/*.test.js"`, no build step; the quotes make node expand the glob rather than the shell.
+      - name: Run npm test
+        run: npm test
+
+      # node --test exits 0 when its pattern matches nothing, so a renamed directory would turn the step above into a no-op that reports success.
+      # It counts files on disk, NOT tests executed: a glob the runner's shell mangled would still pass here, which is what to read the run's own output for.
+      - name: Guard against an empty test glob
+        shell: bash
+        run: |
+          count=$(find test -type f -name '*.test.js' | wc -l | tr -d ' ')
+          echo "Found $count *.test.js file(s) under test/:"
+          find test -type f -name '*.test.js' | sort | sed 's/^/  /'
+          if [ "$count" -eq 0 ]; then
+            echo "::error::No *.test.js files under test/; npm test ran nothing."
+            exit 1
+          fi
+
+  # Nothing else catches an expression typo or a shellcheck-visible bug before a run fails at trigger
+  # time. A digest-pinned docker ref rather than npx, so the npm dependency tree stays frozen.
+  actionlint:
+    name: lint workflow files
+    runs-on: ubuntu-latest
+    # One container pull plus a lint of two files; minutes only so a stuck pull fails fast.
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Lint the workflow files
+        uses: docker://rhysd/actionlint:1.7.12@sha256:b1934ee5f1c509618f2508e6eb47ee0d3520686341fec936f3b79331f9315667
+        env:
+          # SC2016 flags single-quoted `node -e` scripts whose ${} is a JS template literal (publish.yml's
+          # tag guard); the quoting is the point, and actionlint ignores in-script directives.
+          SHELLCHECK_OPTS: --exclude=SC2016
+        with:
+          args: -color
