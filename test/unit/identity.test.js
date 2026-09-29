@@ -2,10 +2,20 @@
 // Identification decides what may be signalled, so every case here is about what the guard is allowed
 // to conclude, not about what it happens to read.
 import assert from 'node:assert/strict';
+import { execSync } from 'node:child_process';
 import fs from 'node:fs';
 import test from 'node:test';
 
-import { argvOf, compareArgv, identify, isAlive, parseCimAnswer, windowsCommandLine } from '../../src/identity.js';
+import {
+	argvOf,
+	compareArgv,
+	identify,
+	identifyBudgetMs,
+	isAlive,
+	parseCimAnswer,
+	probeCim,
+	windowsCommandLine,
+} from '../../src/identity.js';
 import { deadPid, fixture, pidOf, readyLine, skipOnWindows, waitFor, WINDOWS, withSpawn } from '../support/harness.js';
 
 // Harper's vm-current-context sandbox substitutes node:child_process with only these five names;
@@ -207,6 +217,81 @@ test('a win32 node that cannot run the probe answers unknown, never a match', (t
 		assert.equal(identify(process.pid, [process.execPath]), 'unknown');
 		assert.equal(isAlive(1), true, 'liveness must not go through the probe');
 	});
+});
+
+/**
+ * What execSync throws for `script` run under `timeoutMs`, so a stand-in for PowerShell fails the way Node does.
+ *
+ * @param {string} script @param {number} timeoutMs @returns {unknown}
+ */
+function thrownBy(script, timeoutMs) {
+	try {
+		execSync(`"${process.execPath}" -e "${script}"`, { encoding: 'utf-8', timeout: timeoutMs, stdio: 'ignore' });
+	} catch (error) {
+		return error;
+	}
+	throw new Error(`${script} returned inside ${timeoutMs}ms`);
+}
+
+const SERVICE = ['C:\\Program Files\\svc\\worker.exe', 'run'];
+
+test('a probe that runs out of time once and then answers still identifies the process', () => {
+	const timedOut = thrownBy('setTimeout(Date.now,5000)', 100);
+	let calls = 0;
+	/** @type {import('../../src/identity.js').ExecSync} */
+	const exec = () => {
+		calls += 1;
+		if (calls === 1) throw timedOut;
+		return `live ${windowsCommandLine(SERVICE)}\r\n`;
+	};
+	const seen = probeCim(4242, exec);
+	onPlatform('win32', () =>
+		assert.equal(compareArgv(seen.argv, SERVICE), 'match', 'a cold first start cost the verdict')
+	);
+	assert.equal(calls, 2);
+});
+
+test('a probe that never answers is "cannot tell" once its attempts are spent, all inside the identify budget', () => {
+	const timedOut = thrownBy('setTimeout(Date.now,5000)', 100);
+	/** @type {number[]} */
+	const budgets = [];
+	/** @type {import('../../src/identity.js').ExecSync} */
+	const exec = (_command, options) => {
+		budgets.push(options.timeout ?? Number.POSITIVE_INFINITY);
+		// Past any sane attempt count, so a retry loop with no bound fails here rather than hanging the run.
+		throw budgets.length > 10 ? new Error('still asking') : timedOut;
+	};
+	const seen = probeCim(4242, exec);
+	// alive with no argv is what identify() turns into 'unknown'; not alive would be 'differs'.
+	assert.deepEqual(seen, { alive: true, argv: null });
+	onPlatform('win32', () => assert.equal(compareArgv(seen.argv, SERVICE), 'unknown'));
+	assert.ok(budgets.length > 1, 'a timed-out probe was not tried again');
+	const spent = budgets.reduce((sum, ms) => sum + ms, 0);
+	assert.ok(
+		spent <= identifyBudgetMs('win32'),
+		`${budgets.length} attempts can wait ${spent}ms, past the ${identifyBudgetMs('win32')}ms identify budget`
+	);
+});
+
+test('a probe that fails for any reason but time is asked once, and one that answers is asked once', () => {
+	const failed = thrownBy('process.exit(1)', 5000);
+	let calls = 0;
+	/** @type {import('../../src/identity.js').ExecSync} */
+	const refuses = () => {
+		calls += 1;
+		throw failed;
+	};
+	assert.deepEqual(probeCim(4242, refuses), { alive: true, argv: null });
+	assert.equal(calls, 1, 'a failure that is not a timeout was paid for twice');
+
+	calls = 0;
+	/** @type {import('../../src/identity.js').ExecSync} */
+	const answers = () => {
+		calls += 1;
+		return 'gone\r\n';
+	};
+	assert.deepEqual(probeCim(4242, answers), { alive: false, argv: null });
+	assert.equal(calls, 1, 'a probe that answered was started again');
 });
 
 test('a liveness poll on win32 does not pay for a command line nobody asked for', (t) => {

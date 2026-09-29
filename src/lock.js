@@ -6,16 +6,49 @@ import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { threadId } from 'node:worker_threads';
 
-import { identify, IDENTIFY_BUDGET_MS, isAlive } from './identity.js';
+import { aliveBudgetMs, identify, identifyBudgetMs, isAlive } from './identity.js';
 import { errnoCode, errorMessage } from './exit.js';
 
 /** How long a thread waits before looking again at another thread's unfinished claim, which is one file read. */
 const CLAIM_POLL_MS = 2;
 /** A free gate is usually a read, at most one signal and a rename away, so a waiter looks again at once. */
 const GATE_RETRY_MS = 1;
-// Above IDENTIFY_BUDGET_MS: adjudicate identifies inside the gate, and a writer that gave up first would
-// break a gate a live thread is in.
-const GATE_WAIT_MS = IDENTIFY_BUDGET_MS + 1000;
+/** How long a spawn that came back without a pid gets to say why. Here because the claim stays unfinished across it. */
+export const START_FAILURE_MS = 1000;
+/** No default claim budget drops below this, whatever the probes it sums cost. */
+const CLAIM_FLOOR_MS = 30_000;
+/** For the steps with no timeout of their own, the host's spawn calls and the lock writes among them. */
+const CLAIM_MARGIN_MS = 5000;
+
+/** The longest a thread holds the gate: adjudicate checks the pid the lock names is alive, then identifies it.
+ * @param {NodeJS.Platform} platform */
+function gateHoldMs(platform) {
+	return aliveBudgetMs(platform) + identifyBudgetMs(platform);
+}
+
+/** Above the gate hold: a writer that gave up sooner would break a gate a live thread is in, and both would
+ * decide one lock. @param {NodeJS.Platform} [platform] @returns {number} */
+export function gateWaitMs(platform = process.platform) {
+	return gateHoldMs(platform) + 1000;
+}
+const GATE_WAIT_MS = gateWaitMs();
+
+/** A waiter that spends this takes over an unfinished claim, so it outlasts the claimant's longest path to a
+ * commit whichever caller claims; test/unit/lock.test.js spells the path out.
+ * @param {NodeJS.Platform} [platform] @returns {number} */
+export function claimTimeoutMs(platform = process.platform) {
+	const alive = aliveBudgetMs(platform);
+	const identifying = identifyBudgetMs(platform);
+	// A round that ended "cannot tell", then the claimant's own, taken up to one check of the holder late.
+	const rounds = gateHoldMs(platform) + alive + gateHoldMs(platform);
+	// The reaper's two spawns: each checks a handed-back pid or waits on a start that failed.
+	const spawns = 2 * Math.max(alive + identifying, START_FAILURE_MS);
+	const commit = gateWaitMs(platform) + alive;
+	// One status read on the claimant's thread at a yield: currentReaper identifies twice.
+	const statusRead = 2 * identifying;
+	return Math.max(CLAIM_FLOOR_MS, rounds + spawns + commit + statusRead + CLAIM_MARGIN_MS);
+}
+export const CLAIM_TIMEOUT_MS = claimTimeoutMs();
 const GATE_SUFFIX = '.claiming';
 
 /**
@@ -246,7 +279,7 @@ function adjudicate(held, { name, version, argv, stopOrphans, expired, notes }) 
  * @param {boolean} [options.stopOrphans] Whether an identified orphan may be signalled. Off by default.
  * @returns {Promise<Claim>}
  */
-export async function claimLock({ pidDir, name, version, argv, timeoutMs = 30_000, stopOrphans = false }) {
+export async function claimLock({ pidDir, name, version, argv, timeoutMs = CLAIM_TIMEOUT_MS, stopOrphans = false }) {
 	mkdirSync(pidDir, { recursive: true });
 	const path = lockPath(pidDir, name);
 	const token = `${process.pid}.${threadId}.${++serial}.${Date.now().toString(36)}`;
@@ -329,8 +362,8 @@ export async function safeLockWrite(write) {
 
 /** @param {string} path @param {(held: Lock | null) => WriteOutcome} write @returns {Promise<WriteOutcome>} */
 async function writeUnderGate(path, write) {
-	// A gate is held across an identification at worst, so wait that out. The budget matters only for a
-	// thread that died mid-decision.
+	// A gate is held across a liveness check and an identification at worst, so wait that out. The budget
+	// matters only for a thread that died mid-decision.
 	const deadline = Date.now() + GATE_WAIT_MS;
 	for (;;) {
 		const done = underGate(path, Date.now() >= deadline, () => write(readLock(path)));

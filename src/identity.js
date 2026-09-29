@@ -18,9 +18,21 @@ const PS_TIMEOUT_MS = 2000;
 // Every thread of a host probes the same lock at once, and eight PowerShell starts in parallel each take
 // seconds rather than the fraction of one a lone start takes.
 const CIM_TIMEOUT_MS = 10_000;
-/** The longest inspect() can take on this host. lock.js holds its gate across an identify, so a waiter that
- * gives up sooner breaks a gate a live thread is inside and both then decide one lock. */
-export const IDENTIFY_BUDGET_MS = process.platform === 'win32' ? CIM_TIMEOUT_MS : PS_TIMEOUT_MS;
+// A start that timed out gets one more: the first on a cold host may have paid a warm-up the second skips.
+const CIM_ATTEMPTS = 2;
+
+/** The longest inspect() can take on `platform`. lock.js holds its gate across an identify, so a waiter that
+ * gives up sooner breaks a gate a live thread is inside and both then decide one lock.
+ * @param {NodeJS.Platform} [platform] @returns {number} */
+export function identifyBudgetMs(platform = process.platform) {
+	return platform === 'win32' ? CIM_TIMEOUT_MS * CIM_ATTEMPTS : PS_TIMEOUT_MS;
+}
+export const IDENTIFY_BUDGET_MS = identifyBudgetMs();
+/** The longest isAlive() can take: inspect() makes the read identify makes, except on win32 where kill(pid, 0) answers.
+ * @param {NodeJS.Platform} [platform] @returns {number} */
+export function aliveBudgetMs(platform = process.platform) {
+	return platform === 'win32' ? 0 : identifyBudgetMs(platform);
+}
 /** The two answers the win32 probe may print, so the script that writes them and the reader below are one protocol. */
 const LIVE = 'live';
 const GONE = 'gone';
@@ -40,6 +52,37 @@ export function parseCimAnswer(stdout) {
 	if (text !== LIVE && !text.startsWith(`${LIVE} `)) return null;
 	const commandLine = text.slice(LIVE.length).trim();
 	return { alive: true, argv: commandLine === '' ? null : [commandLine] };
+}
+
+/** @typedef {(command: string, options: import('node:child_process').ExecSyncOptionsWithStringEncoding) => string} ExecSync */
+
+/**
+ * The win32 command-line read, exported so a test can stand in for PowerShell. Only a timeout is tried
+ * again: any other failure is the host's answer, and a second start would give it again.
+ *
+ * @param {number} pid One kill(pid, 0) found alive, and an integer, which keeps the shell string safe.
+ * @param {ExecSync} [exec]
+ * @returns {{ alive: boolean, argv: string[] | null }} argv null is "cannot tell", as it is from inspect().
+ */
+export function probeCim(pid, exec = execSync) {
+	// PowerShell CIM: `wmic` is gone from recent Windows and `tasklist` has no command line. Each call
+	// is a PowerShell start, which is why nothing polls it.
+	const script =
+		`[Console]::OutputEncoding=[Text.Encoding]::UTF8;` +
+		`$p=Get-CimInstance Win32_Process -Filter 'ProcessId=${pid}' -ErrorAction Stop;` +
+		`if($null -eq $p){'${GONE}'}else{'${LIVE} '+$p.CommandLine}`;
+	for (let attempt = 1; ; attempt++) {
+		try {
+			const stdout = exec(`powershell.exe -NoProfile -NonInteractive -Command "${script}"`, {
+				encoding: 'utf-8',
+				timeout: CIM_TIMEOUT_MS,
+				stdio: ['ignore', 'pipe', 'ignore'],
+			});
+			return parseCimAnswer(stdout) ?? { alive: true, argv: null };
+		} catch (error) {
+			if (errnoCode(error) !== 'ETIMEDOUT' || attempt >= CIM_ATTEMPTS) return { alive: true, argv: null };
+		}
+	}
 }
 
 /**
@@ -121,18 +164,7 @@ function inspect(pid, withCommandLine = true) {
 		if (process.platform === 'win32') {
 			// Liveness never reaches the probe: libuv's kill(pid, 0) already answered it above.
 			if (!withCommandLine) return { alive: true, argv: null };
-			// PowerShell CIM: `wmic` is gone from recent Windows and `tasklist` has no command line. Each call
-			// is a PowerShell start, which is why nothing polls it.
-			const script =
-				`[Console]::OutputEncoding=[Text.Encoding]::UTF8;` +
-				`$p=Get-CimInstance Win32_Process -Filter 'ProcessId=${pid}' -ErrorAction Stop;` +
-				`if($null -eq $p){'${GONE}'}else{'${LIVE} '+$p.CommandLine}`;
-			const stdout = execSync(`powershell.exe -NoProfile -NonInteractive -Command "${script}"`, {
-				encoding: 'utf-8',
-				timeout: CIM_TIMEOUT_MS,
-				stdio: ['ignore', 'pipe', 'ignore'],
-			});
-			return parseCimAnswer(stdout) ?? { alive: true, argv: null };
+			return probeCim(pid);
 		}
 	} catch {
 		// Liveness was answered by kill(pid, 0); a command line nothing can read is "cannot tell".

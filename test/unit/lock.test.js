@@ -6,8 +6,19 @@ import path from 'node:path';
 import test from 'node:test';
 import { Worker } from 'node:worker_threads';
 
-import { argvOf, IDENTIFY_BUDGET_MS, isAlive } from '../../src/identity.js';
-import { claimLock, commitLock, lockPath, readLock, releaseLock, safeLockWrite } from '../../src/lock.js';
+import { aliveBudgetMs, argvOf, identifyBudgetMs, isAlive } from '../../src/identity.js';
+import {
+	CLAIM_TIMEOUT_MS,
+	claimLock,
+	claimTimeoutMs,
+	commitLock,
+	gateWaitMs,
+	lockPath,
+	readLock,
+	releaseLock,
+	safeLockWrite,
+	START_FAILURE_MS,
+} from '../../src/lock.js';
 import {
 	deadPid,
 	fixture,
@@ -436,13 +447,65 @@ test('a lock file with no guard record reads as a lock with no record, not as a 
 		assert.equal(readLock(file), null);
 	}));
 
+const PLATFORMS = /** @type {NodeJS.Platform[]} */ (['linux', 'darwin', 'win32']);
+
+/** adjudicate checks that the pid the lock names is alive and then identifies it, all inside the gate.
+ * @param {NodeJS.Platform} platform */
+const gateHold = (platform) => aliveBudgetMs(platform) + identifyBudgetMs(platform);
+
+/**
+ * What a thread that entered claimLock beside the claimant waits through until the claim commits, step by step.
+ *
+ * @param {NodeJS.Platform} platform @returns {[string, number][]}
+ */
+function claimantPath(platform) {
+	const alive = aliveBudgetMs(platform);
+	// describeHandedBackPid checks the pid is alive, then reads its command line; a pid-less spawn waits instead.
+	const spawn = Math.max(alive + identifyBudgetMs(platform), START_FAILURE_MS);
+	return [
+		['a round in the gate that ends "cannot tell"', gateHold(platform)],
+		['the claimant finding the gate free, one check of its holder late', alive],
+		["the claimant's own round, which publishes the unfinished claim", gateHold(platform)],
+		["launchReaper's first spawn", spawn],
+		['its second spawn, under the other command', spawn],
+		['the commit waiting on the gate', gateWaitMs(platform)],
+		["its last check of the gate's holder", alive],
+		[
+			"a status read on the claimant's thread at a yield, where currentReaper identifies twice",
+			2 * identifyBudgetMs(platform),
+		],
+	];
+}
+
+test('a writer outlasts the longest gate hold before it breaks the gate, on every platform', () => {
+	for (const platform of PLATFORMS) {
+		assert.ok(
+			gateWaitMs(platform) > gateHold(platform),
+			`${platform}: a writer breaks the gate after ${gateWaitMs(platform)}ms, inside a ${gateHold(platform)}ms hold`
+		);
+	}
+});
+
+test('a waiter beside the claimant outlasts its whole path to a committed lock, on every platform', () => {
+	for (const platform of PLATFORMS) {
+		const steps = claimantPath(platform);
+		const total = steps.reduce((sum, [, ms]) => sum + ms, 0);
+		assert.ok(
+			claimTimeoutMs(platform) > total,
+			`${platform}: a waiter takes the claim over at ${claimTimeoutMs(platform)}ms, and the claimant can take ` +
+				`${total}ms to commit: ${steps.map(([step, ms]) => `${step} ${ms}ms`).join('; ')}`
+		);
+	}
+	assert.equal(CLAIM_TIMEOUT_MS, claimTimeoutMs(), 'the default claim budget is not the one for this platform');
+});
+
 test(
-	'a writer waits out the longest identification before it breaks a gate, so no live thread is left inside one',
-	// Costs IDENTIFY_BUDGET_MS + the margin in wall clock, because the wait it measures is the subject.
+	'a writer waits out the longest gate hold before it breaks a gate, so no live thread is left inside one',
+	// Costs the gate wait in wall clock, because the wait it measures is the subject.
 	{ timeout: slow(30_000) },
 	() =>
 		withTempDir('guard-lock-', async (dir) => {
-			// identify() can take the whole budget inside the gate, and a live holder leaves only the budget to clear it.
+			// A live holder leaves only the budget to clear it.
 			const file = lockPath(dir, 'held');
 			seedLock(file, { pid: process.pid, token: 'ours', argv: ['/bin/thing'] });
 			fs.writeFileSync(`${file}.claiming`, String(process.pid), 'utf-8');
@@ -451,12 +514,10 @@ test(
 			assert.equal(await commitLock(file, 'ours', 4242, 1, ['/bin/thing']), 'written', 'the write never landed');
 			const waited = Date.now() - started;
 
-			// The probe is not all the gate covers, so a writer clearing the budget by a millisecond has no margin.
+			// The probes are not all the gate covers, so a writer clearing them by a millisecond has no margin.
 			const rest = 500;
-			assert.ok(
-				waited >= IDENTIFY_BUDGET_MS + rest,
-				`the gate was broken after ${waited}ms, inside a ${IDENTIFY_BUDGET_MS}ms identification`
-			);
+			const hold = gateHold(process.platform);
+			assert.ok(waited >= hold + rest, `the gate was broken after ${waited}ms, inside a ${hold}ms hold`);
 			assert.equal(readLock(file)?.pid, 4242);
 		})
 );

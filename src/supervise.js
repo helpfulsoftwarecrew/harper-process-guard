@@ -8,10 +8,7 @@ import { argvOf, compareArgv, isAlive } from './identity.js';
 // Which exits mean somebody shut it down lives in exit.js, so this file and a consumer's status endpoint
 // cannot disagree about the same signal. Restarting into one of these fights the operator.
 import { describeSpawnFailure, errorMessage, isDeliberate } from './exit.js';
-import { claimLock, commitLock, lockPath, readLock, releaseLock, safeLockWrite } from './lock.js';
-
-/** How long a spawn that came back without a pid gets to say why. Bounded because this blocks a start. */
-const START_FAILURE_MS = 1000;
+import { claimLock, commitLock, lockPath, readLock, releaseLock, safeLockWrite, START_FAILURE_MS } from './lock.js';
 
 /**
  * @typedef {object} Tuning

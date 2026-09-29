@@ -50,7 +50,7 @@ Every thread makes the same call. One starts the process; the rest join it and w
 | `version`        | `0`      | Fingerprint of whatever forces a replacement. A process under another one is an orphan.          |
 | `stopOrphans`    | `false`  | Whether an identified orphan may be sent SIGTERM.                                                |
 | `log`            | silent   | `info`, `warn`, `error`.                                                                         |
-| `claimTimeoutMs` | `30000`  | How long a claim waits on another thread's unfinished one.                                       |
+| `claimTimeoutMs` | `34000`  | How long a claim waits on another thread's unfinished one. `146000` on Windows, as below.        |
 | `reaper`         | none     | `name`, `graceMs` (8000), `replacementPidFile`, `logFile`, `spawnOptions`. No reaper without it. |
 
 `verify` runs once everything is up, reaper included, and its verdict lands on the state.
@@ -83,7 +83,7 @@ was about the processes it runs. None of it knows what the supervised processes 
 
 ## Windows
 
-`process.kill` is `TerminateProcess` there: a process an operator stopped is indistinguishable from a crash and is restarted, and a reaper stopped that way leaves its own lock behind. A command-line lookup costs a PowerShell start, so liveness polls never take one; only a lock claim and a reap target pay for it.
+`process.kill` is `TerminateProcess` there: a process an operator stopped is indistinguishable from a crash and is restarted, and a reaper stopped that way leaves its own lock behind. A command-line lookup costs a PowerShell start, and a second one when the first runs out of time, so liveness polls never take one. Everything that identifies a pid pays: a lock claim, a pid a host's spawn handed back, the reaper before it signals, and the node-level reads in `node.js`, `keepReaperAlive`'s check once a minute among them. A thread waiting on another's unfinished claim can sit through several of those in a row, which is why the default `claimTimeoutMs` there is 146 s.
 
 ## To do
 

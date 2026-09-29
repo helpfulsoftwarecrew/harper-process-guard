@@ -6,7 +6,7 @@ import { fileURLToPath } from 'node:url';
 
 import { describeSpawnFailure, errorMessage } from './exit.js';
 import { clearStaleHostPidFiles, keepReaperAlive } from './node.js';
-import { claimLock, commitLock, lockPath, readLock, releaseLock, safeLockWrite } from './lock.js';
+import { CLAIM_TIMEOUT_MS, claimLock, commitLock, lockPath, readLock, releaseLock, safeLockWrite } from './lock.js';
 import { DEFAULT_TUNING, describeHandedBackPid, startFailure, superviseProcess } from './supervise.js';
 
 /** @typedef {import('./host.js').Log} Log */
@@ -231,7 +231,7 @@ export async function guard({
 	stopOrphans = false,
 	log = SILENT,
 	reaper,
-	claimTimeoutMs = 30_000,
+	claimTimeoutMs = CLAIM_TIMEOUT_MS,
 }) {
 	/** @type {string[]} */
 	const report = [];
