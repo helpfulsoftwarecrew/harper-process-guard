@@ -6,9 +6,9 @@ import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { pathToFileURL } from 'node:url';
 
-import { identify, isAlive, STOP_POLL_MS, waitWhileAlive } from './identity.js';
+import { identifyKept, isAlive, STOP_POLL_MS, waitWhileAlive } from './identity.js';
 import { errorMessage } from './exit.js';
-import { readLock, unlinkQuietly } from './lock.js';
+import { readLock, removeLock, unlinkQuietly } from './lock.js';
 
 const DEFAULT_WATCH_POLL_MS = 1000;
 const DEFAULT_TERM_GRACE_MS = 5000;
@@ -75,32 +75,39 @@ export function collectTargets(options) {
  * @param {ReaperOptions} options @param {{ path: string; pid: number; argv: readonly string[] }} target
  */
 export async function reapTarget(options, target) {
+	// Read again inside the gate, since a keeper may have committed a restart since collectTargets read it.
 	// A pid of 0 identifies as 'differs' rather than reaching kill(2), where it would name a process GROUP.
-	const verdict = identify(target.pid, target.argv);
-	unlinkQuietly(target.path);
-	if (verdict !== 'match') {
-		log(options, `${target.path}: pid ${target.pid} is not that process (${verdict}); left alone`);
+	const removed = await removeLock(target.path, (held) =>
+		identifyKept(held.pid, held.argv, held.keeper, held.keeperArgv ?? [], held.started)
+	);
+	if (removed.held === null) {
+		log(options, `${target.path}: already gone`);
+		return;
+	}
+	const { pid } = removed.held;
+	if (removed.decision !== 'match') {
+		log(options, `${target.path}: pid ${pid} is not that process (${removed.decision}); left alone`);
 		return;
 	}
 
 	try {
-		process.kill(target.pid, 'SIGTERM');
-		log(options, `sent SIGTERM to ${target.pid} (${target.path})`);
+		process.kill(pid, 'SIGTERM');
+		log(options, `sent SIGTERM to ${pid} (${target.path})`);
 	} catch (error) {
-		log(options, `could not SIGTERM ${target.pid}: ${errorMessage(error)}`);
+		log(options, `could not SIGTERM ${pid}: ${errorMessage(error)}`);
 		return;
 	}
 
 	const grace = options.termGraceMs ?? DEFAULT_TERM_GRACE_MS;
-	await waitWhileAlive(target.pid, Date.now() + grace, STOP_POLL_MS);
-	if (!isAlive(target.pid)) return;
+	await waitWhileAlive(pid, Date.now() + grace, STOP_POLL_MS);
+	if (!isAlive(pid)) return;
 
 	// SIGKILL reaches only a pid identified above; signalling an unnamed one would be this module's own defect.
 	try {
-		process.kill(target.pid, 'SIGKILL');
-		log(options, `${target.pid} ignored SIGTERM for ${grace}ms; sent SIGKILL`);
+		process.kill(pid, 'SIGKILL');
+		log(options, `${pid} ignored SIGTERM for ${grace}ms; sent SIGKILL`);
 	} catch (error) {
-		log(options, `could not SIGKILL ${target.pid}: ${errorMessage(error)}`);
+		log(options, `could not SIGKILL ${pid}: ${errorMessage(error)}`);
 	}
 }
 

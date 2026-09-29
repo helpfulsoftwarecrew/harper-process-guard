@@ -4,11 +4,23 @@
 import { accessSync, constants, existsSync } from 'node:fs';
 import { setTimeout as delay } from 'node:timers/promises';
 
-import { argvOf, compareArgv, isAlive } from './identity.js';
+import { aliveBudgetMs, argvOf, compareArgv, identify, identifyKept, isAlive } from './identity.js';
 // Which exits mean somebody shut it down lives in exit.js, so this file and a consumer's status endpoint
 // cannot disagree about the same signal. Restarting into one of these fights the operator.
 import { describeSpawnFailure, errorMessage, isDeliberate } from './exit.js';
-import { claimLock, commitLock, lockPath, readLock, releaseLock, safeLockWrite, START_FAILURE_MS } from './lock.js';
+import { KEEPER_SCRIPT, keeperArgs, readRecord } from './keeper.js';
+import {
+	claimLock,
+	commitLock,
+	gateWaitMs,
+	keeperBootMs,
+	lockPath,
+	readLock,
+	releaseLock,
+	releaseUnstarted,
+	safeLockWrite,
+	START_FAILURE_MS,
+} from './lock.js';
 
 /**
  * @typedef {object} Tuning
@@ -46,14 +58,14 @@ export const DEFAULT_TUNING = { deathPollMs: 2000, restartMax: 5, restartBaseMs:
  * @property {string} title
  * @property {number | undefined} [pid]
  * @property {boolean} started
- * @property {boolean} adopted True when this thread joined a process another thread started.
- * @property {boolean} exited True once this thread has seen it die, so a status surface stops reading healthy.
+ * @property {boolean} adopted True when this thread joined a process it did not start, a keeper's restart included.
+ * @property {boolean} exited True once this thread has seen it die, with `code` and `signal` already set wherever either can be known.
  * @property {number} restarts
  * @property {string | undefined} [error]
  * @property {boolean} [verified] Set from the caller's verify().
  * @property {string | undefined} [verifyDetail]
- * @property {number | undefined} [code] Exit code of a child this thread spawned. Unset for a joined process.
- * @property {string | undefined} [signal] Signal that killed a child this thread spawned. Unset for a joined process.
+ * @property {number | undefined} [code] Exit code of the last death, from its keeper or from a child this thread spawned.
+ * @property {string | undefined} [signal] Signal that ended the last death, from the same two sources.
  */
 
 /**
@@ -67,10 +79,37 @@ export const DEFAULT_TUNING = { deathPollMs: 2000, restartMax: 5, restartBaseMs:
  * @property {string[]} report
  * @property {Tuning} tuning
  * @property {{ stopping: boolean }} run Set by the caller's stop(), so no restart outruns a shutdown.
+ * @property {boolean} [keeper] Start each process under a keeper, whose exit record every thread can read.
+ */
+
+/**
+ * A keeper's claim on a lock, which is how a thread finds the record of a death it did not see. `since` is when this
+ * thread began watching: a record from then on is about that process or a later one of the same keeper.
+ *
+ * @typedef {{ token: string, keeper: number, keeperArgv: readonly string[], since: number }} Kept
  */
 
 /** Unref'd so nothing here holds the host open; outliving the host is the reaper's job. @param {number} ms */
 const backoff = (ms) => delay(ms, undefined, { ref: false });
+
+/** Absolute first because PATH cannot shadow it, then the bare `node` a host allowlist tends to carry. */
+const KEEPER_COMMANDS = [process.execPath, 'node'];
+/** A lock and record read each, so a start waiting on its keeper polls without forking anything. */
+const KEEPER_WATCH_MS = 10;
+/** How often a thread waiting for a keeper's record checks the keeper is still there to write one. */
+const KEEPER_ALIVE_MS = 250;
+/** Two node starts and a start-time read, then the keeper's own commit waiting out the gate. */
+const keeperStartMs = () => keeperBootMs() + gateWaitMs() + aliveBudgetMs();
+
+/** The descriptors a caller's stdio pipes to its thread; Node pipes any of the first three left unset.
+ * @param {import('node:child_process').StdioOptions | undefined} stdio @returns {number[]} */
+function pipedByThread(stdio) {
+	const slots = Array.isArray(stdio) ? stdio : [stdio, stdio, stdio];
+	return [0, 1, 2].filter((fd) => {
+		const slot = slots[fd];
+		return slot === undefined || slot === null || slot === 'pipe' || slot === 'overlapped';
+	});
+}
 
 /** Refuse a binary that is not there or not executable. spawn's own failure arrives asynchronously and names less. @param {string} binaryPath */
 function preflight(binaryPath) {
@@ -233,9 +272,16 @@ async function attempt(ctx, descriptor, state, restarts) {
 		);
 		// Read now, while the lock is still there: the death below is answered from a lock that may be gone.
 		const holder = readLock(lockPath(ctx.pidDir, descriptor.name));
-		void answerDeath(ctx, descriptor, state, restarts, watchPid(ctx, claim.pid), null, holder?.host ?? 0);
+		const kept =
+			holder?.keeper !== undefined && holder.pid === claim.pid
+				? { token: holder.token, keeper: holder.keeper, keeperArgv: holder.keeperArgv ?? [], since: Date.now() }
+				: null;
+		void answerDeath(ctx, descriptor, state, restarts, watchPid(ctx, claim.pid), null, holder?.host ?? 0, kept);
 		return;
 	}
+
+	// A host that refuses node for the keeper still gets its process, started the way it was before keepers.
+	if (ctx.keeper && (await startKept(ctx, descriptor, state, claim.token, restarts))) return;
 
 	/** @type {SpawnedChild} */
 	let child;
@@ -277,8 +323,8 @@ async function attempt(ctx, descriptor, state, restarts) {
 		return;
 	}
 
-	// A second 'exit' listener alongside watchChild's own; Node fires both. This is the only place
-	// state.code and state.signal are ever set, since a joined process has no child to ask.
+	// A second 'exit' listener alongside watchChild's own; Node fires both. A thread with no child of its own
+	// reads state.code and state.signal from a keeper's record instead.
 	child.on('exit', (code, signal) => {
 		state.code = code ?? undefined;
 		state.signal = signal ?? undefined;
@@ -294,7 +340,295 @@ async function attempt(ctx, descriptor, state, restarts) {
 		ctx.log.error(`process guard: ${state.error}`);
 	}
 	ctx.log.info(`process guard: started the ${state.title} (pid ${child.pid}): ${descriptor.argv.join(' ')}.`);
-	void answerDeath(ctx, descriptor, state, restarts, death, claim.token, process.pid);
+	void answerDeath(ctx, descriptor, state, restarts, death, claim.token, process.pid, null);
+}
+
+/**
+ * Start the process under a keeper, which commits its pid on the lock under this claim's token. False when the
+ * host refused every command the launcher was offered, and the caller starts the process itself.
+ *
+ * @param {Context} ctx @param {Descriptor} descriptor @param {ProcessState} state @param {string} token @param {number} restarts
+ * @returns {Promise<boolean>}
+ */
+async function startKept(ctx, descriptor, state, token, restarts) {
+	const path = lockPath(ctx.pidDir, descriptor.name);
+	const { restartMax, restartBaseMs } = ctx.tuning;
+	const flags = keeperArgs({
+		lock: path,
+		token,
+		version: ctx.version,
+		hostPid: process.pid,
+		restarts,
+		restartMax,
+		restartBaseMs,
+		piped: pipedByThread(descriptor.spawnOptions.stdio),
+		argv: descriptor.argv,
+	});
+	const args = [KEEPER_SCRIPT, '--launch', ...flags];
+	/** @type {string[]} */
+	const refusals = [];
+	for (const command of KEEPER_COMMANDS) {
+		/** @type {SpawnedChild} */
+		let launcher;
+		try {
+			// The caller's options reach the launcher, and its environment, cwd and stdio pass on to the process.
+			launcher = ctx.spawn(command, args, { ...descriptor.spawnOptions, name: descriptor.name });
+		} catch (error) {
+			refusals.push(`${command}: ${errorMessage(error)}`);
+			continue;
+		}
+		launcher.on?.('error', (error) => {
+			if (launcher.pid)
+				ctx.log.error(`process guard: the keeper launcher for the ${state.title} failed: ${error.message}`);
+		});
+		if (!launcher.pid) {
+			refusals.push(`${command}: ${await startFailure(launcher)}`);
+			continue;
+		}
+		const handedBack = describeHandedBackPid(launcher, { argv: [command, ...args], binaryPath: KEEPER_SCRIPT });
+		if (handedBack) {
+			refusals.push(`${command}: ${handedBack}`);
+			continue;
+		}
+
+		const started = await awaitKeeper(path, token, launcher);
+		if ('error' in started) {
+			const message = `the ${state.title} failed to start: ${started.error}`;
+			failAttempt(ctx, state, message, `${message} (${descriptor.binaryPath})`);
+			if (started.release) await releaseClaim(ctx, descriptor, token);
+			return true;
+		}
+		state.pid = started.pid;
+		state.started = true;
+		state.adopted = false;
+		ctx.log.info(
+			`process guard: started the ${state.title} (pid ${started.pid}) under keeper ${started.keeper}: ${descriptor.argv.join(' ')}.`
+		);
+		const kept = { token, keeper: started.keeper, keeperArgv: started.keeperArgv, since: Date.now() };
+		// A process that has already ended is answered from its keeper's record now, rather than a poll later.
+		const death = started.ended ? Promise.resolve('its keeper recorded its end') : watchPid(ctx, started.pid);
+		void answerDeath(ctx, descriptor, state, restarts, death, null, process.pid, kept);
+		return true;
+	}
+
+	const note =
+		`the keeper for the ${state.title} could not be started (${refusals.join('; ')}), so this thread starts it ` +
+		`itself and its exit is lost once this thread ends. Permit ${process.execPath} or a bare \`node\` wherever this host filters spawns.`;
+	ctx.log.warn(`process guard: ${note}`);
+	if (restarts === 0) ctx.report.push(note);
+	return false;
+}
+
+/**
+ * Wait for the keeper to commit the pid it started, or to say why it could not. `release` is whether the claim is
+ * still this thread's to give back.
+ *
+ * @param {string} path @param {string} token @param {SpawnedChild} launcher
+ * @returns {Promise<{ pid: number, keeper: number, keeperArgv: readonly string[], ended: boolean } | { error: string, release: boolean }>}
+ */
+async function awaitKeeper(path, token, launcher) {
+	/** @type {string | null} */
+	let launcherExit = null;
+	const reaped = new Promise((resolve) => {
+		if (typeof launcher.once !== 'function') return resolve(undefined);
+		launcher.once('exit', (code, signal) => {
+			launcherExit = signal ? `signal ${signal}` : `exit code ${code}`;
+			resolve(undefined);
+		});
+	});
+	// Reaped before the caller returns, so a thread ended right after the start leaves no zombie launcher.
+	const reapLauncher = async () => {
+		const grace = new AbortController();
+		await Promise.race([reaped, delay(START_FAILURE_MS, undefined, { signal: grace.signal }).catch(() => {})]);
+		grace.abort();
+	};
+	// Held timers throughout: a host awaiting guard() may have nothing else on its event loop.
+	const deadline = Date.now() + keeperStartMs();
+	for (;;) {
+		const held = readLock(path);
+		const record = readRecord(path);
+		if (held?.token === token && held.pid > 0 && held.keeper !== undefined) {
+			await reapLauncher();
+			return { pid: held.pid, keeper: held.keeper, keeperArgv: held.keeperArgv ?? [], ended: false };
+		}
+		if (record?.token === token && record.outcome === 'failed') {
+			// The lock was read first, so it can predate the keeper's own release inside the gate; `released` cannot.
+			const release = record.released !== true && held?.token === token;
+			return { error: record.error ?? 'its keeper gave no reason', release };
+		}
+		// Ended between two looks: its keeper writes the record before the lock goes, so it is here when the lock is not.
+		if (record?.token === token && record.pid > 0) {
+			await reapLauncher();
+			return { pid: record.pid, keeper: record.keeper, keeperArgv: [], ended: true };
+		}
+		if (held?.token !== token)
+			return { error: 'its claim was taken over before its keeper named a pid', release: false };
+		const gaveUp =
+			launcherExit !== null && launcherExit !== 'exit code 0'
+				? `the keeper's launcher ended with ${launcherExit}`
+				: Date.now() >= deadline
+					? `its keeper named no pid within ${keeperStartMs()}ms`
+					: null;
+		if (gaveUp !== null) {
+			// Given back inside the gate only while it names no pid: a keeper that committed since the look above is
+			// joined, and a lock gone or taken is answered by the next look.
+			/** @type {Awaited<ReturnType<typeof releaseUnstarted>>} */
+			let given;
+			try {
+				given = await releaseUnstarted(path, token);
+			} catch (error) {
+				return { error: `${gaveUp}, and giving back its claim failed: ${errorMessage(error)}`, release: false };
+			}
+			if (given === 'gone' || given === 'taken') continue;
+			if (given === 'written' || given.keeper === undefined) return { error: gaveUp, release: false };
+			await reapLauncher();
+			return { pid: given.pid, keeper: given.keeper, keeperArgv: given.keeperArgv ?? [], ended: false };
+		}
+		await delay(KEEPER_WATCH_MS);
+	}
+}
+
+/** @param {{ code: number | null, signal: string | null }} record */
+const causeOf = ({ code, signal }) => (signal ? `signal ${signal}` : `exit code ${code}`);
+
+/** The fields of a state that say which pid ended and how. @param {import('./keeper.js').ExitRecord} record */
+const endedBy = ({ pid, code, signal }) => ({
+	...(pid > 0 ? { pid } : {}),
+	code: code ?? undefined,
+	signal: signal ?? undefined,
+});
+
+/**
+ * The keeper's record of the death of `pid`, or null once the keeper is gone or a gate wait passes without one.
+ *
+ * @param {string} path @param {Kept} kept @param {number} pid
+ * @returns {Promise<import('./keeper.js').ExitRecord | null>}
+ */
+async function keeperRecord(path, kept, pid) {
+	// A crash loop overwrites the record of the death this thread saw with a later one, which still answers it.
+	const matches = (/** @type {import('./keeper.js').ExitRecord | null} */ record) =>
+		record?.token === kept.token && (record.pid === pid || record.at >= kept.since);
+	const deadline = Date.now() + gateWaitMs();
+	let checked = Date.now();
+	for (;;) {
+		const record = readRecord(path);
+		if (matches(record)) return record;
+		if (Date.now() >= deadline) return null;
+		if (Date.now() - checked >= KEEPER_ALIVE_MS) {
+			checked = Date.now();
+			// Read once more after the keeper is found gone: it may have written on its way out.
+			if (!isAlive(kept.keeper)) {
+				const last = readRecord(path);
+				return matches(last) ? last : null;
+			}
+		}
+		await backoff(KEEPER_WATCH_MS);
+	}
+}
+
+/**
+ * Answer a death from the keeper's record of it. False leaves the death to the lock, which is how a thread
+ * answers one no keeper recorded.
+ *
+ * @param {Context} ctx @param {Descriptor} descriptor @param {ProcessState} state
+ * @param {import('./keeper.js').ExitRecord} record @param {Kept} kept @param {number} lockHost
+ * @returns {Promise<boolean>}
+ */
+async function answerKept(ctx, descriptor, state, record, kept, lockHost) {
+	const cause = causeOf(record);
+	Object.assign(state, endedBy(record));
+	const hint = cause.startsWith('exit code') && descriptor.exitHint ? ` ${descriptor.exitHint}` : '';
+	if (record.outcome === 'released') {
+		if (record.error) {
+			state.error = `the ${descriptor.name} lock could not be released after a deliberate stop: ${record.error}`;
+			ctx.log.error(`process guard: ${state.error}`);
+		}
+		ctx.log.info(`process guard: the ${state.title} (pid ${state.pid}) was shut down (${cause}); not restarting it.`);
+		return true;
+	}
+	if (record.outcome === 'taken' && isDeliberate(cause)) {
+		ctx.log.warn(
+			`process guard: the ${state.title} (pid ${state.pid}) was stopped (${cause}) by whatever now holds ` +
+				`the ${descriptor.name} lock, not by an operator; that thread is starting its replacement.`
+		);
+		return true;
+	}
+	if (record.outcome === 'gave-up') {
+		state.error = `died ${record.restarts + 1} times (${cause}); not restarting it again`;
+		ctx.log.error(
+			`process guard: the ${state.title} ${state.error}. What it provided is missing from this node ` +
+				`until the component reloads.${hint}`
+		);
+		return true;
+	}
+	if (record.outcome === 'failed') {
+		state.error = `died (${cause}) and its keeper could not start it again: ${record.error ?? 'no reason given'}`;
+		ctx.log.error(`process guard: the ${state.title} ${state.error}.${hint}`);
+		return true;
+	}
+	if (record.outcome !== 'restarting') return false;
+
+	ctx.log.warn(
+		`process guard: the ${state.title} (pid ${state.pid}) is gone (${cause}). Its keeper starts it again in ` +
+			`${record.waitMs}ms and this thread joins that (restart ${record.restarts} of ${ctx.tuning.restartMax}).${hint}`
+	);
+	await rejoinKept(ctx, descriptor, state, record, kept, lockHost);
+	return true;
+}
+
+/**
+ * Join the replacement a keeper announced, and never start one while that keeper lives: past the cap it releases
+ * the lock, and a thread that claimed it then would start a second. A lock no longer the keeper's is answered by lock.
+ *
+ * @param {Context} ctx @param {Descriptor} descriptor @param {ProcessState} state
+ * @param {import('./keeper.js').ExitRecord} record @param {Kept} kept @param {number} lockHost
+ */
+async function rejoinKept(ctx, descriptor, state, record, kept, lockHost) {
+	const path = lockPath(ctx.pidDir, descriptor.name);
+	await backoff(Math.max(0, record.at + record.waitMs - Date.now()));
+	let checked = Date.now();
+	for (;;) {
+		if (ctx.run.stopping) return;
+		let keeperGone = false;
+		// Looked at before the reads below, so a keeper found gone has already written everything it will.
+		if (Date.now() - checked >= KEEPER_ALIVE_MS) {
+			checked = Date.now();
+			keeperGone = identify(kept.keeper, kept.keeperArgv) === 'differs';
+		}
+		const held = readLock(path);
+		const latest = readRecord(path);
+		// Records are written inside the gate ahead of any release, so a lock found gone has its reason here already.
+		const newer =
+			latest?.token === kept.token &&
+			(latest.at !== record.at || latest.pid !== record.pid || latest.outcome !== record.outcome);
+		if (newer && latest) {
+			if (!(await answerKept(ctx, descriptor, state, latest, kept, lockHost)))
+				await answerByLock(ctx, descriptor, state, latest.restarts, causeOf(latest), null, lockHost);
+			return;
+		}
+		if (
+			held?.token === kept.token &&
+			held.pid > 0 &&
+			held.pid !== record.pid &&
+			identifyKept(held.pid, held.argv, kept.keeper, kept.keeperArgv, held.started) === 'match'
+		) {
+			Object.assign(state, { pid: held.pid, restarts: record.restarts, started: true, adopted: true, exited: false });
+			Object.assign(state, { error: undefined, code: undefined, signal: undefined });
+			ctx.log.info(
+				`process guard: the ${state.title} runs again under its keeper (pid ${held.pid}); this thread joined it.`
+			);
+			const again = watchPid(ctx, held.pid);
+			void answerDeath(ctx, descriptor, state, record.restarts, again, null, lockHost, { ...kept, since: Date.now() });
+			return;
+		}
+		// No deadline: a live keeper either commits or records, and a claim beside it would start a second process.
+		if (held?.token !== kept.token || keeperGone) {
+			// The restart the keeper announced is this thread's to answer now, counted as the same one.
+			await answerByLock(ctx, descriptor, state, record.restarts - 1, causeOf(record), null, lockHost);
+			return;
+		}
+		await backoff(KEEPER_WATCH_MS);
+	}
 }
 
 /**
@@ -302,13 +636,40 @@ async function attempt(ctx, descriptor, state, restarts) {
  * nobody owns and joins whatever another thread started.
  *
  * @param {Context} ctx @param {Descriptor} descriptor @param {ProcessState} state @param {number} restarts
- * @param {Promise<string>} death @param {string | null} token The owner's lock token; null when this thread only joined.
+ * @param {Promise<string>} death @param {string | null} token The owner's lock token; null when this thread only joined or a keeper holds it.
  * @param {number} lockHost Pid of the host holding the lock: this process when it owns it, and whatever the lock named when this thread joined it.
+ * @param {Kept | null} kept The keeper whose record says what happened, when a keeper is the process's parent.
  */
-async function answerDeath(ctx, descriptor, state, restarts, death, token, lockHost) {
-	const cause = await death;
+async function answerDeath(ctx, descriptor, state, restarts, death, token, lockHost, kept) {
+	const polled = await death;
 	if (ctx.run.stopping) return;
+	const path = lockPath(ctx.pidDir, descriptor.name);
+	const record = kept ? await keeperRecord(path, kept, state.pid ?? 0) : null;
+	if (ctx.run.stopping) return;
+	// Only now: a status read that finds it exited must find how it ended, which the record alone may know.
+	if (record) Object.assign(state, endedBy(record));
 	state.exited = true;
+	if (record && kept && (await answerKept(ctx, descriptor, state, record, kept, lockHost))) return;
+	// An orphan's exit status reaches nobody, so this death may be a stop, and a restart would fight it.
+	if (kept && !record && identify(kept.keeper, kept.keeperArgv) === 'differs') {
+		state.error = `died with its keeper (pid ${kept.keeper}) gone, so nothing could read how it ended`;
+		ctx.log.warn(
+			`process guard: the ${state.title} (pid ${state.pid}) ${state.error}. It may have been stopped on ` +
+				`purpose, so nothing starts it again until a thread calls guard().`
+		);
+		return;
+	}
+	await answerByLock(ctx, descriptor, state, restarts, record ? causeOf(record) : polled, token, lockHost);
+}
+
+/**
+ * A death answered from the lock alone: release it on a deliberate stop this thread owns, leave one another
+ * holder answered, and otherwise go back through it after the backoff.
+ *
+ * @param {Context} ctx @param {Descriptor} descriptor @param {ProcessState} state @param {number} restarts
+ * @param {string} cause @param {string | null} token @param {number} lockHost
+ */
+async function answerByLock(ctx, descriptor, state, restarts, cause, token, lockHost) {
 	const path = lockPath(ctx.pidDir, descriptor.name);
 	const hint = cause.startsWith('exit code') && descriptor.exitHint ? ` ${descriptor.exitHint}` : '';
 

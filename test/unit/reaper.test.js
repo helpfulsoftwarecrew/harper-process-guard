@@ -115,6 +115,22 @@ test('a lock naming a pid nothing holds is removed and nothing is signalled', ()
 		assert.equal(fs.existsSync(lockPath(dir, 'stale')), false);
 	}));
 
+test('a lock is reaped for the pid it names when it is reaped, not the one it named when the reaper listed it', () =>
+	withTempDir('guard-reap-', (dir) =>
+		withSpawn(async ({ spawn }) => {
+			const argv = [process.execPath, fixture('idle.js'), `recommitted-${process.pid}`];
+			seedLock(lockPath(dir, 'recommitted'), { pid: await deadPid(), argv });
+			const [listed] = collectTargets(options(dir));
+			// A keeper commits the restart it owes between the reaper's listing and its turn at this lock.
+			const restarted = await running(spawn, argv[2] ?? '');
+			seedLock(lockPath(dir, 'recommitted'), { pid: restarted.pid, argv });
+
+			await reapTarget(options(dir, { termGraceMs: 300 }), listed ?? assert.fail('no target'));
+			assert.equal(fs.existsSync(lockPath(dir, 'recommitted')), false);
+			assert.equal(isAlive(restarted.pid), false, 'the pid the lock named at reaping outlived the reaper');
+		})
+	));
+
 test('when the host goes and nothing replaces it, everything it locked is stopped', () =>
 	withTempDir('guard-reap-', (dir) =>
 		withSpawn(async ({ spawn }) => {

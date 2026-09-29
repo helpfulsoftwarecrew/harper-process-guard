@@ -115,63 +115,108 @@ export function windowsCommandLine(argv) {
 	return argv.map(quoteForWindows).join(' ');
 }
 
+/** @typedef {{ alive: boolean, argv: string[] | null, ppid: number | null, started: string | null }} Inspection */
+
+/** What a pid that is gone, or one nothing can read, reads as. @param {boolean} alive @returns {Inspection} */
+const unread = (alive) => ({ alive, argv: null, ppid: null, started: null });
+
+/** `lstart` in the C locale, which is five words; any other shape would shift the command line after it. */
+const LSTART = /^[A-Z][a-z]{2} [A-Z][a-z]{2} \d{1,2} \d{2}:\d{2}:\d{2} \d{4}$/;
+
+/** The environment `ps` reads in: the host's locale dropped, since any invalid entry leaves ps in C, where it escapes
+ * every non-ASCII byte of a command line. lstart then reads in C and UTC from every process alike. */
+function psEnv() {
+	const env = Object.fromEntries(
+		Object.entries(process.env).filter(([key]) => key !== 'LANG' && !key.startsWith('LC_'))
+	);
+	return { ...env, LC_CTYPE: 'UTF-8', TZ: 'UTC' };
+}
+
+/** @type {string | null | undefined} */
+let bootId;
+/** This boot's id on Linux, read once, or null where it cannot be read. @returns {string | null} */
+function linuxBootId() {
+	if (bootId === undefined) {
+		try {
+			bootId = readFileSync('/proc/sys/kernel/random/boot_id', 'utf-8').trim() || null;
+		} catch {
+			bootId = null;
+		}
+	}
+	return bootId;
+}
+
 /**
- * Whether a pid still runs and what its command line is, answered by one read where one read answers both.
+ * Whether a pid still runs, its command line, parent and start time, answered by one read where one read answers all.
  * A zombie counts as gone; 0 and negatives are refused, since kill(2) reads those as process groups.
  *
  * @param {number} pid
  * @param {boolean} [withCommandLine] False asks liveness alone, which skips a PowerShell on win32 and changes nothing elsewhere.
- * @returns {{ alive: boolean, argv: string[] | null }} argv null is "cannot tell", never "no arguments".
+ * @returns {Inspection} argv null is "cannot tell", never "no arguments".
  */
 function inspect(pid, withCommandLine = true) {
-	if (!Number.isInteger(pid) || pid <= 0) return { alive: false, argv: null };
+	if (!Number.isInteger(pid) || pid <= 0) return unread(false);
 	try {
 		process.kill(pid, 0);
 	} catch (error) {
 		// EPERM counts as alive: it exists, owned by another user.
-		if (errnoCode(error) !== 'EPERM') return { alive: false, argv: null };
+		if (errnoCode(error) !== 'EPERM') return unread(false);
 	}
 	try {
 		if (process.platform === 'linux') {
 			// comm is parenthesised and may hold spaces and parens, so state is the token after the LAST ')'.
 			const stat = readFileSync(`/proc/${pid}/stat`, 'utf-8');
-			if (
-				stat
-					.slice(stat.lastIndexOf(')') + 1)
-					.trim()
-					.startsWith('Z')
-			)
-				return { alive: false, argv: null };
+			const fields = stat
+				.slice(stat.lastIndexOf(')') + 1)
+				.trim()
+				.split(/\s+/);
+			const [state = '', ppid = ''] = fields;
+			if (state.startsWith('Z')) return unread(false);
 			// NUL-separated with a trailing NUL. Empty for a kernel thread, and for an unreadable argv area.
 			const raw = readFileSync(`/proc/${pid}/cmdline`, 'utf-8');
-			return { alive: true, argv: raw === '' ? null : raw.replace(/\0$/, '').split('\0') };
+			const argv = raw === '' ? null : raw.replace(/\0$/, '').split('\0');
+			// Field 22 is clock ticks from boot to the fork, which an exec leaves alone. Ticks repeat across boots
+			// and a lock outlives one, so the boot's id goes with them.
+			const boot = linuxBootId();
+			const ticks = fields[19];
+			return { alive: true, argv, ppid: parentPid(ppid), started: boot && ticks ? `${boot}:${ticks}` : null };
 		}
 		if (process.platform === 'darwin') {
 			// execSync is the only sync spawn Harper's constrained child_process keeps. Safe as a shell string
 			// only because pid was checked an integer above.
-			const [state, ...argv] = execSync(`ps -p ${pid} -o state=,args=`, {
+			const [state, ppid, ...rest] = execSync(`ps -p ${pid} -o state=,ppid=,lstart=,args=`, {
 				encoding: 'utf-8',
 				timeout: PS_TIMEOUT_MS,
 				stdio: ['ignore', 'pipe', 'ignore'],
+				env: psEnv(),
 			})
 				.trim()
 				.split(/\s+/);
-			if (state === undefined) return { alive: false, argv: null };
-			if (state.startsWith('Z')) return { alive: false, argv: null };
+			if (state === undefined) return unread(false);
+			if (state.startsWith('Z')) return unread(false);
+			const started = rest.slice(0, 5).join(' ');
+			if (!LSTART.test(started)) return { ...unread(true), ppid: parentPid(ppid ?? '') };
 			// `ps` joined the vector with single spaces already, which is why compareArgv compares joined text.
-			return { alive: true, argv: argv.length > 0 ? argv : null };
+			const argv = rest.slice(5);
+			return { alive: true, argv: argv.length > 0 ? argv : null, ppid: parentPid(ppid ?? ''), started };
 		}
 		if (process.platform === 'win32') {
 			// Liveness never reaches the probe: libuv's kill(pid, 0) already answered it above.
-			if (!withCommandLine) return { alive: true, argv: null };
-			return probeCim(pid);
+			if (!withCommandLine) return unread(true);
+			return { ...probeCim(pid), ppid: null, started: null };
 		}
 	} catch {
 		// Liveness was answered by kill(pid, 0); a command line nothing can read is "cannot tell".
-		return { alive: true, argv: null };
+		return unread(true);
 	}
 	// Any other platform. A caller that cannot see must do nothing and say why.
-	return { alive: true, argv: null };
+	return unread(true);
+}
+
+/** @param {string} field @returns {number | null} */
+function parentPid(field) {
+	const ppid = Number.parseInt(field, 10);
+	return Number.isInteger(ppid) && ppid > 0 ? ppid : null;
 }
 
 /** @param {number} pid */
@@ -224,4 +269,39 @@ export function compareArgv(actual, expected) {
 export function identify(pid, expected) {
 	const { alive, argv } = inspect(pid);
 	return alive ? compareArgv(argv, expected) : 'differs';
+}
+
+/** The longest identifyKept() can take: a second read when the parent vouches, which no win32 probe reports.
+ * @param {NodeJS.Platform} [platform] @returns {number} */
+export function identifyKeptBudgetMs(platform = process.platform) {
+	return identifyBudgetMs(platform) * (platform === 'win32' ? 1 : 2);
+}
+
+/** When `pid` started, comparable only for equality, or null when it is gone or unreadable. win32 reads none.
+ * @param {number} pid @returns {string | null} */
+export function startedAt(pid) {
+	const { alive, started } = inspect(pid);
+	return alive ? started : null;
+}
+
+/**
+ * identify(), except that a pid whose parent is `keeper` matches while that parent runs `keeperArgv`, through an exec:
+ * a keeper's only other children are the `ps` reads it waits on. Pid 1 and a reused keeper pid vouch for nothing.
+ *
+ * @param {number} pid @param {readonly string[]} expected @param {number | undefined} keeper
+ * @param {readonly string[]} keeperArgv The keeper's command line as its lock records it; empty vouches for nothing.
+ * @param {string} [started] When the process started, as its keeper read it; a pid that still reads so is that process.
+ * @returns {Verdict}
+ */
+export function identifyKept(pid, expected, keeper, keeperArgv, started = undefined) {
+	const { alive, argv, ppid, started: actual } = inspect(pid);
+	if (!alive) return 'differs';
+	// A pid and its start time name one process, through any exec and after its keeper is gone.
+	if (started && actual === started) return 'match';
+	const verdict = compareArgv(argv, expected);
+	if (verdict === 'match' || keeper === undefined || keeper <= 1 || ppid !== keeper || keeperArgv.length === 0)
+		return verdict;
+	// A parent that cannot be identified leaves its child unidentified, never "not ours".
+	const vouched = identify(keeper, keeperArgv);
+	return vouched === 'differs' ? verdict : vouched;
 }

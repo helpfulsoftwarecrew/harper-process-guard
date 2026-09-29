@@ -11,6 +11,8 @@ export const WINDOWS = process.platform === 'win32';
 /** test/support sits two levels below the repo root. */
 export const REPO_ROOT = path.resolve(import.meta.dirname, '..', '..');
 const FIXTURES = path.join(REPO_ROOT, 'test', 'fixtures');
+/** A path rather than an import, so this harness also loads against a source tree that has no keeper. */
+export const KEEPER_SCRIPT = path.join(REPO_ROOT, 'src', 'keeper.js');
 
 /** @param {string} name @returns {string} */
 export const fixture = (name) => path.join(FIXTURES, name);
@@ -71,9 +73,53 @@ export async function withTempDir(prefix, run) {
 	try {
 		return await run(dir);
 	} finally {
+		await stopKeepers(dir);
 		// Retried on Windows, where unlink refuses a file another process still holds open: a reaper this
 		// test started may not have closed its log yet.
 		fs.rmSync(dir, { recursive: true, force: true, maxRetries: WINDOWS ? 10 : 0, retryDelay: 50 });
+	}
+}
+
+/** Every process as `ps` lists it, POSIX only. @returns {{ pid: number, ppid: number, stat: string, args: string }[]} */
+export function processTable() {
+	const table = realSpawnSync('ps', ['-A', '-o', 'pid=,ppid=,stat=,args='], { encoding: 'utf-8' });
+	if (table.error || table.status !== 0)
+		throw new Error(`the process table could not be read: ${table.error ?? `exit ${table.status}`}`);
+	return table.stdout.split('\n').flatMap((line) => {
+		const row = /^\s*(\d+)\s+(\d+)\s+(\S+)\s+(.*)$/.exec(line);
+		return row ? [{ pid: Number(row[1]), ppid: Number(row[2]), stat: row[3] ?? '', args: row[4] ?? '' }] : [];
+	});
+}
+
+/**
+ * Every keeper whose lock is under `dir`, and the process each is the parent of, killed. A keeper restarts what a
+ * test's own cleanup kills, so it is frozen first and cannot start another between the listing and the kill.
+ *
+ * @param {string} dir
+ */
+async function stopKeepers(dir) {
+	if (WINDOWS) return;
+	// Only a directory that ever held a lock can have had a keeper, which spares the rest a `ps`.
+	const entries = fs.readdirSync(dir, { recursive: true }).map(String);
+	if (!entries.some((entry) => entry.endsWith('.pid') || entry.endsWith('.exit'))) return;
+	for (let round = 0; round < 5; round++) {
+		const keepers = processTable().filter((row) => row.args.includes(KEEPER_SCRIPT) && row.args.includes(dir));
+		if (keepers.length === 0) return;
+		for (const { pid } of keepers) signalQuietly(pid, 'SIGSTOP');
+		await new Promise((resolve) => setTimeout(resolve, 20));
+		const frozen = new Set(keepers.map((row) => row.pid));
+		const children = processTable().filter((row) => frozen.has(row.ppid));
+		for (const { pid } of [...children, ...keepers]) signalQuietly(pid, 'SIGKILL');
+		await new Promise((resolve) => setTimeout(resolve, 50));
+	}
+}
+
+/** @param {number} pid @param {NodeJS.Signals} signal */
+function signalQuietly(pid, signal) {
+	try {
+		process.kill(pid, signal);
+	} catch {
+		// Already gone, which is the outcome asked for.
 	}
 }
 
@@ -195,11 +241,12 @@ export function context(pidDir, spawn, overrides = {}) {
  * Written by hand rather than through the module under test, so a broken writer cannot seed a passing test.
  *
  * @param {string} file
- * @param {{ pid: number, version?: number, token?: string, host?: number, argv?: readonly string[] }} lock
+ * @param {{ pid: number, version?: number, token?: string, host?: number, argv?: readonly string[], keeper?: number, keeperArgv?: readonly string[] }} lock
  */
-export function seedLock(file, { pid, version = 1, token = 'seeded', host = 1, argv = [] }) {
+export function seedLock(file, { pid, version = 1, token = 'seeded', host = 1, argv = [], keeper, keeperArgv = [] }) {
 	fs.mkdirSync(path.dirname(file), { recursive: true });
-	fs.writeFileSync(file, `${pid}\n${version}\n${JSON.stringify({ token, host, argv })}\n`, 'utf-8');
+	const kept = keeper === undefined ? {} : { keeper, keeperArgv };
+	fs.writeFileSync(file, `${pid}\n${version}\n${JSON.stringify({ token, host, argv, ...kept })}\n`, 'utf-8');
 }
 
 /**

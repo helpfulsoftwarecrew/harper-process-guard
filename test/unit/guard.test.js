@@ -17,6 +17,7 @@ import {
 	readyLine,
 	REPO_ROOT,
 	seedLock,
+	settle,
 	skipOnWindows,
 	slow,
 	waitFor,
@@ -51,18 +52,19 @@ function stopReaper(reaper) {
  *
  * @param {string} dir Written here, which is also the pidDir every caller passes; a `.js` is not a `.pid`.
  * @param {object} options guard() options, minus the spawn the script supplies itself.
- * @param {{ park?: boolean }} [shape] park keeps the host up until something kills it, the way a host stays up.
+ * @param {{ park?: boolean, refuseNode?: boolean }} [shape] park keeps the host up until killed; refuseNode refuses it a keeper.
  * @returns {string} Path of the script.
  */
-function writeHost(dir, options, { park = false } = {}) {
-	const file = path.join(dir, 'host-variant.js');
+function writeHost(dir, options, { park = false, refuseNode = false } = {}) {
+	const file = path.join(dir, refuseNode ? 'host-unkept.js' : 'host-variant.js');
 	const module = pathToFileURL(path.join(REPO_ROOT, 'src', 'index.js')).href;
+	const refusing = `(command, args, options) => { if (String(args[0]).endsWith('keeper.js')) throw new Error('refused'); return spawn(command, args, options); }`;
 	fs.writeFileSync(
 		file,
 		[
 			`import { spawn } from 'node:child_process';`,
 			`import { guard } from ${JSON.stringify(module)};`,
-			`const result = await guard({ ...${JSON.stringify(options)}, spawn });`,
+			`const result = await guard({ ...${JSON.stringify(options)}, spawn: ${refuseNode ? refusing : 'spawn'} });`,
 			`process.stdout.write(JSON.stringify({ guarded: result.processes[0]?.pid, reaper: result.reaper }) + '\\n');`,
 			...(park ? ['setInterval(() => {}, 1 << 30);'] : []),
 		].join('\n'),
@@ -356,6 +358,32 @@ test('a host that permits only a bare `node` gets one reaper, not one per caller
 		})
 	));
 
+test('a pidDir whose path holds non-ASCII still has one process and one reaper, however many threads call', () =>
+	withTempDir('guard-café-', (dir) =>
+		withSpawn(async ({ spawn }) => {
+			const options = {
+				pidDir: dir,
+				spawn,
+				reaper: { name: 'reaper', graceMs: 100 },
+				processes: [declare(`non-ascii-${process.pid}`)],
+			};
+			const results = [await guard(options), await guard(options), await guard(options)];
+			const [first] = results;
+			try {
+				assert.equal(first?.processes[0]?.started, true, `nothing started: ${first?.processes[0]?.error}`);
+				for (const later of results.slice(1)) {
+					assert.equal(later.processes[0]?.adopted, true, 'a later caller started a second process');
+					assert.equal(later.processes[0]?.pid, first?.processes[0]?.pid);
+					assert.equal(later.reaper?.adopted, true, 'a later caller started a second reaper');
+					assert.equal(later.reaper?.pid, first?.reaper?.pid);
+				}
+			} finally {
+				for (const result of results) result.stop();
+				stopReaper(first?.reaper);
+			}
+		})
+	));
+
 test(
 	'a host that returns from guard() exits, because the reaper it left running does not hold its event loop',
 	{ timeout: slow(60_000) },
@@ -386,6 +414,50 @@ test(
 				}
 			})
 		)
+);
+
+test(
+	'a host with no other work exits once guard() returns when its process runs under a keeper, and not while one it spawned does',
+	{ timeout: slow(60_000) },
+	(t) => {
+		if (skipOnWindows(t, 'no keeper runs on win32, so there the process a thread spawns holds its host open.')) return;
+		return withTempDir('guard-call-', (dir) =>
+			withSpawn(async ({ spawn }) => {
+				/** @param {string} name @param {boolean} refuseNode */
+				const hostFor = async (name, refuseNode) => {
+					const processes = [declare(`${name}-${process.pid}`, name)];
+					const host = spawn(process.execPath, [writeHost(dir, { pidDir: dir, processes }, { refuseNode })], {
+						stdio: ['ignore', 'pipe', 'ignore'],
+					});
+					/** @type {{ code: number | null; signal: string | null } | null} */
+					let ended = null;
+					host.once('exit', (code, signal) => {
+						ended = { code, signal };
+					});
+					const started = JSON.parse(await readyLine(host));
+					assert.equal(typeof started.guarded, 'number', `the ${name} host started nothing`);
+					return { host, started, ended: () => ended };
+				};
+				const kept = await hostFor('kept', false);
+				await waitFor(() => kept.ended() !== null, 'the host to exit once guard() returned', {
+					timeoutMs: slow(15_000),
+					intervalMs: 20,
+				});
+				assert.deepEqual(kept.ended(), { code: 0, signal: null });
+				assert.equal(isAlive(kept.started.guarded), true, 'the process did not outlive its host');
+
+				const unkept = await hostFor('unkept', true);
+				try {
+					await settle(1500);
+					assert.equal(unkept.ended(), null, 'a host exited while a process it spawned itself still ran');
+				} finally {
+					// The host first, or its thread restarts the process it sees die.
+					unkept.host.kill('SIGKILL');
+					process.kill(unkept.started.guarded, 'SIGKILL');
+				}
+			})
+		);
+	}
 );
 
 test(

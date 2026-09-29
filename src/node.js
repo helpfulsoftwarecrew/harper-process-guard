@@ -6,7 +6,8 @@ import { readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { threadId } from 'node:worker_threads';
 
-import { argvOf, identify as identifyPid } from './identity.js';
+import { argvOf, identify as identifyPid, identifyKept } from './identity.js';
+import { KEEPER_SCRIPT } from './keeper.js';
 import { readLock } from './lock.js';
 
 /** Bytes per /proc kB field. */
@@ -215,9 +216,10 @@ export function clearStaleHostPidFiles(root, named, log, label = 'process guard'
 		if (!Number.isInteger(pid) || pid <= 0) continue;
 		const running = argvOf(pid);
 		if (running === null) continue;
-		const ours = argv
-			? identifyPid(pid, argv) === 'match'
-			: running.some((argument) => argument.endsWith(script ?? ' '));
+		// A keeper's launcher runs under the process's name for the moment it takes to start the keeper.
+		const ours =
+			running.join(' ').includes(KEEPER_SCRIPT) ||
+			(argv ? identifyPid(pid, argv) === 'match' : running.some((argument) => argument.endsWith(script ?? ' ')));
 		if (ours) continue;
 		try {
 			unlinkSync(file);
@@ -250,7 +252,7 @@ export function nodeProcess(state, pidDir, supervision = 'guard') {
 	const diedHere = state.exited === true && supervision === 'guard';
 	if (!unstartedHere && !diedHere) return state;
 	const held = heldProcess(join(pidDir, `${state.name}.pid`));
-	if (!held || identifyPid(held.pid, held.argv) !== 'match')
+	if (!held || identifyKept(held.pid, held.argv, held.keeper, held.keeperArgv ?? [], held.started) !== 'match')
 		// Nothing of this name runs on the node. The dead pid stays: `started: false` says it is not running,
 		// and which pid died is what an operator reads the log for.
 		return diedHere ? { ...state, started: false } : state;

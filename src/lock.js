@@ -6,7 +6,7 @@ import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { threadId } from 'node:worker_threads';
 
-import { aliveBudgetMs, identify, identifyBudgetMs, isAlive } from './identity.js';
+import { aliveBudgetMs, identify, identifyBudgetMs, identifyKept, identifyKeptBudgetMs, isAlive } from './identity.js';
 import { errnoCode, errorMessage } from './exit.js';
 
 /** How long a thread waits before looking again at another thread's unfinished claim, which is one file read. */
@@ -19,11 +19,15 @@ export const START_FAILURE_MS = 1000;
 const CLAIM_FLOOR_MS = 30_000;
 /** For the steps with no timeout of their own, the host's spawn calls and the lock writes among them. */
 const CLAIM_MARGIN_MS = 5000;
+/** Two node starts, the keeper's launcher and then the keeper, before the keeper reads its process's start time. */
+const KEEPER_BOOT_MS = 5000;
+/** How often a claim looks again while a keeper restarts the process its lock names; each look forks a `ps` on darwin. */
+const KEEPER_POLL_MS = 50;
 
-/** The longest a thread holds the gate: adjudicate checks the pid the lock names is alive, then identifies it.
- * @param {NodeJS.Platform} platform */
+/** The longest a thread holds the gate: adjudicate checks the pid the lock names is alive, then identifies it,
+ * through its keeper at worst. @param {NodeJS.Platform} platform */
 function gateHoldMs(platform) {
-	return aliveBudgetMs(platform) + identifyBudgetMs(platform);
+	return aliveBudgetMs(platform) + identifyKeptBudgetMs(platform);
 }
 
 /** Above the gate hold: a writer that gave up sooner would break a gate a live thread is in, and both would
@@ -46,7 +50,12 @@ export function claimTimeoutMs(platform = process.platform) {
 	const commit = gateWaitMs(platform) + alive;
 	// One status read on the claimant's thread at a yield: currentReaper identifies twice.
 	const statusRead = 2 * identifying;
-	return Math.max(CLAIM_FLOOR_MS, rounds + spawns + commit + statusRead + CLAIM_MARGIN_MS);
+	return Math.max(CLAIM_FLOOR_MS, rounds + spawns + keeperBootMs(platform) + commit + statusRead + CLAIM_MARGIN_MS);
+}
+
+/** A keeper's start up to its commit, and none on win32 where no keeper runs. @param {NodeJS.Platform} [platform] */
+export function keeperBootMs(platform = process.platform) {
+	return platform === 'win32' ? 0 : KEEPER_BOOT_MS + identifyBudgetMs(platform);
 }
 export const CLAIM_TIMEOUT_MS = claimTimeoutMs();
 const GATE_SUFFIX = '.claiming';
@@ -58,7 +67,12 @@ const GATE_SUFFIX = '.claiming';
  * @property {string} token The claimant's own mark; nothing may overwrite a lock carrying another's.
  * @property {number} host Pid of the process holding the claim, so a waiter can tell a dead claimant.
  * @property {readonly string[]} argv What was spawned, so a later reader can identify the pid before acting.
+ * @property {number} [keeper] Pid of the keeper that is the process's parent and holds the token for it.
+ * @property {readonly string[]} [keeperArgv] A leading run of the keeper's command line, which identifies it.
+ * @property {string} [started] When the process started, which its keeper read; see identifyKept.
  */
+
+/** @typedef {{ host: number, keeper: number, keeperArgv: readonly string[], started?: string }} Owner Who holds a lock a keeper writes. */
 
 /**
  * @typedef {{ outcome: 'won', token: string, notes: string[] }
@@ -83,9 +97,14 @@ export function unlinkQuietly(path) {
 
 /** @param {Lock} lock @returns {string} */
 function serialise(lock) {
-	const record = { token: lock.token, host: lock.host, argv: lock.argv };
+	const kept = lock.keeper === undefined ? {} : { keeper: lock.keeper, keeperArgv: lock.keeperArgv ?? [] };
+	const started = lock.started === undefined ? {} : { started: lock.started };
+	const record = { token: lock.token, host: lock.host, argv: lock.argv, ...kept, ...started };
 	return `${lock.pid}\n${lock.version}\n${JSON.stringify(record)}\n`;
 }
+
+/** @param {unknown} value @returns {value is string[]} */
+const isArgv = (value) => Array.isArray(value) && value.every((/** @type {unknown} */ a) => typeof a === 'string');
 
 /**
  * pid on line 1, version on line 2, so a host reading only those two still reads this. Line 3 is the guard's
@@ -110,12 +129,18 @@ export function readLock(path) {
 	try {
 		const record = /** @type {unknown} */ (JSON.parse(lines[2] ?? ''));
 		if (typeof record !== 'object' || record === null) return lock;
-		const { token, host, argv } = /** @type {{ token?: unknown; host?: unknown; argv?: unknown }} */ (record);
+		const { token, host, argv, keeper, keeperArgv, started } =
+			/** @type {{ token?: unknown; host?: unknown; argv?: unknown; keeper?: unknown; keeperArgv?: unknown; started?: unknown }} */ (
+				record
+			);
 		if (typeof token === 'string') lock.token = token;
 		if (typeof host === 'number' && Number.isInteger(host)) lock.host = host;
-		if (Array.isArray(argv) && argv.every((/** @type {unknown} */ a) => typeof a === 'string')) {
-			lock.argv = /** @type {string[]} */ (argv);
+		if (isArgv(argv)) lock.argv = argv;
+		if (typeof keeper === 'number' && Number.isInteger(keeper) && keeper > 0) {
+			lock.keeper = keeper;
+			lock.keeperArgv = isArgv(keeperArgv) ? keeperArgv : [];
 		}
+		if (typeof started === 'string' && started !== '') lock.started = started;
 	} catch {
 		// Absent, half-written, or not this guard's. Either way, no record.
 	}
@@ -212,7 +237,7 @@ function signal(pid) {
  *
  * @param {Lock | null} held
  * @param {{ name: string, version: number, argv: readonly string[], stopOrphans: boolean, expired: boolean, notes: Set<string> }} against
- * @returns {{ act: 'take', stop?: number } | { act: 'wait' } | { act: 'adopt', pid: number }}
+ * @returns {{ act: 'take', stop?: number } | { act: 'wait', pollMs?: number } | { act: 'adopt', pid: number }}
  */
 function adjudicate(held, { name, version, argv, stopOrphans, expired, notes }) {
 	if (!held) return { act: 'take' };
@@ -226,11 +251,14 @@ function adjudicate(held, { name, version, argv, stopOrphans, expired, notes }) 
 	}
 
 	if (!isAlive(held.pid)) {
+		// A live keeper is between a death and the restart it owes, and taking the lock would start a second.
+		const keeper = held.keeper === undefined ? 'differs' : identify(held.keeper, held.keeperArgv ?? []);
+		if (keeper !== 'differs' && !expired) return { act: 'wait', pollMs: KEEPER_POLL_MS };
 		notes.add(`${name}: reclaimed the lock from pid ${held.pid}, which nothing holds.`);
 		return { act: 'take' };
 	}
 
-	const running = identify(held.pid, held.argv);
+	const running = identifyKept(held.pid, held.argv, held.keeper, held.keeperArgv ?? [], held.started);
 	// 'unknown' is "not established", never "not ours": taking on it starts a second process for a pid that
 	// is most likely the first.
 	if (running === 'unknown' && !expired) return { act: 'wait' };
@@ -302,7 +330,7 @@ export async function claimLock({ pidDir, name, version, argv, timeoutMs = CLAIM
 		if (verdict === null) await delay(GATE_RETRY_MS);
 		else if (verdict.act === 'take') return { outcome: 'won', token, notes: [...notes] };
 		else if (verdict.act === 'adopt') return { outcome: 'adopted', pid: verdict.pid, notes: [...notes] };
-		else await delay(CLAIM_POLL_MS);
+		else await delay(verdict.pollMs ?? CLAIM_POLL_MS);
 	}
 }
 
@@ -314,13 +342,14 @@ export async function claimLock({ pidDir, name, version, argv, timeoutMs = CLAIM
  * pid onto the winner's file.
  *
  * @param {string} path @param {string} token @param {number} pid @param {number} version @param {readonly string[]} argv
+ * @param {Owner} [owner] A keeper's commit, which names the host that launched it rather than the keeper.
  * @returns {Promise<WriteOutcome>}
  */
-export function commitLock(path, token, pid, version, argv) {
+export function commitLock(path, token, pid, version, argv, owner = undefined) {
 	return writeUnderGate(path, (held) => {
 		if (held === null) return 'gone';
 		if (held.token !== token) return 'taken';
-		publish(path, { pid, version, token, host: process.pid, argv });
+		publish(path, { pid, version, token, argv, host: process.pid, ...owner });
 		return 'written';
 	});
 }
@@ -329,14 +358,51 @@ export function commitLock(path, token, pid, version, argv) {
  * Remove the lock while it is still ours. The one place a lock is removed rather than replaced: its process
  * was shut down on purpose and nothing should adopt it.
  *
- * @param {string} path @param {string} token @returns {Promise<WriteOutcome>}
+ * @param {string} path @param {string} token
+ * @param {() => void} [beforeRemoving] Runs inside the gate once the lock is known to be ours, ahead of the removal.
+ * @returns {Promise<WriteOutcome>}
  */
-export function releaseLock(path, token) {
+export function releaseLock(path, token, beforeRemoving = undefined) {
 	return writeUnderGate(path, (held) => {
 		if (held === null) return 'gone';
 		if (held.token !== token) return 'taken';
+		beforeRemoving?.();
 		unlinkQuietly(path);
 		return 'written';
+	});
+}
+
+/**
+ * Give back a claim while it names no pid. One its keeper committed after the thread stopped waiting stays and is
+ * returned, since removing it left that process running with no lock and the next claim started a second copy.
+ *
+ * @param {string} path @param {string} token @returns {Promise<WriteOutcome | Lock>}
+ */
+export function releaseUnstarted(path, token) {
+	return writeUnderGate(path, (held) => {
+		if (held === null) return 'gone';
+		if (held.token !== token) return 'taken';
+		if (held.pid > 0) return held;
+		unlinkQuietly(path);
+		return 'written';
+	});
+}
+
+/**
+ * The reaper's removal, whatever token the lock carries. `decide` reads it inside the gate, so a keeper's later
+ * commit finds it gone and one already made is what gets decided on. A lock the guard did not write stays.
+ *
+ * @template T
+ * @param {string} path @param {(held: Lock) => T} decide
+ * @returns {Promise<{ held: Lock, decision: T } | { held: null }>} `held` is null when no lock of the guard's was there.
+ */
+export function removeLock(path, decide) {
+	return writeUnderGate(path, (held) => {
+		// Never null itself: underGate reads null as a gate that was not free.
+		if (held === null || held.token === '' || held.argv.length === 0) return { held: null };
+		const decision = decide(held);
+		unlinkQuietly(path);
+		return { held, decision };
 	});
 }
 
@@ -360,7 +426,7 @@ export async function safeLockWrite(write) {
 	}
 }
 
-/** @param {string} path @param {(held: Lock | null) => WriteOutcome} write @returns {Promise<WriteOutcome>} */
+/** @template T @param {string} path @param {(held: Lock | null) => T} write @returns {Promise<T>} */
 async function writeUnderGate(path, write) {
 	// A gate is held across a liveness check and an identification at worst, so wait that out. The budget
 	// matters only for a thread that died mid-decision.

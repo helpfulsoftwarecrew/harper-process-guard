@@ -6,7 +6,9 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 
+import { argvOf } from '../../src/identity.js';
 import { clearStaleHostPidFiles } from '../../src/index.js';
+import { KEEPER_SCRIPT, pidOf, waitFor, withSpawn } from '../support/harness.js';
 import { withTempDir } from '../support/sandbox.js';
 import { captureLogs } from '../support/sandbox.js';
 
@@ -61,6 +63,23 @@ test("a Harper pid file naming the real process is Harper's to keep, and one nam
 		);
 		assert.deepEqual(lines, []);
 	}));
+
+test("a Harper pid file naming a keeper's launcher is the guard's own for that moment, and stays", () =>
+	withTempDir('dd-hpid-', (root) =>
+		withSpawn(async ({ spawn }) => {
+			// Harper records the launcher under the process's name until the launcher exits, a moment later.
+			const standIn = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1 << 30)', KEEPER_SCRIPT, '--launch'], {
+				stdio: 'ignore',
+			});
+			await waitFor(() => argvOf(pidOf(standIn)) !== null, 'the launcher to appear in the process table');
+			write(root, 'datadog-agent', pidOf(standIn));
+			const lines = await captureLogs(() =>
+				clearStaleHostPidFiles(root, [{ name: 'datadog-agent', argv: ['/opt/dd/bin/agent', 'run'] }], console)
+			);
+			assert.equal(fs.existsSync(pidFile(root, 'datadog-agent')), true, "the launcher's file was removed");
+			assert.deepEqual(lines, []);
+		})
+	));
 
 test('a reaper file naming a live pid that is not running reaper.js is removed', () =>
 	withTempDir('dd-hpid-', async (root) => {

@@ -49,7 +49,7 @@ import { DEFAULT_TUNING, describeHandedBackPid, startFailure, superviseProcess }
  * @property {number} version
  * @property {ProcessState[]} processes One state per declared process, in declaration order.
  * @property {ReaperState} [reaper]
- * @property {() => void} stop Halt supervision. Signals nothing and releases no lock, so nothing starts a duplicate.
+ * @property {() => void} stop End this thread's watch, signalling nothing and releasing no lock; a keeper still restarts a crash.
  */
 
 /** @type {Log} */
@@ -236,8 +236,10 @@ export async function guard({
 	/** @type {string[]} */
 	const report = [];
 	const run = { stopping: false };
+	// No keeper on win32: it leaves no zombie and none has run there, so an exit reaches only the spawning thread.
+	const keeper = process.platform !== 'win32';
 	/** @type {import('./supervise.js').Context} */
-	const ctx = { pidDir, spawn, version, stopOrphans, log, claimTimeoutMs, report, run, tuning: DEFAULT_TUNING };
+	const ctx = { pidDir, spawn, version, stopOrphans, log, claimTimeoutMs, report, run, tuning: DEFAULT_TUNING, keeper };
 
 	/** @type {ProcessState[]} */
 	const states = [];

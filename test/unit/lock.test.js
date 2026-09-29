@@ -13,6 +13,7 @@ import {
 	claimTimeoutMs,
 	commitLock,
 	gateWaitMs,
+	keeperBootMs,
 	lockPath,
 	readLock,
 	releaseLock,
@@ -449,9 +450,10 @@ test('a lock file with no guard record reads as a lock with no record, not as a 
 
 const PLATFORMS = /** @type {NodeJS.Platform[]} */ (['linux', 'darwin', 'win32']);
 
-/** adjudicate checks that the pid the lock names is alive and then identifies it, all inside the gate.
- * @param {NodeJS.Platform} platform */
-const gateHold = (platform) => aliveBudgetMs(platform) + identifyBudgetMs(platform);
+/** adjudicate checks that the pid the lock names is alive and identifies it inside the gate, through its keeper when
+ * its own argv does not match, a read no win32 probe makes. @param {NodeJS.Platform} platform */
+const gateHold = (platform) =>
+	aliveBudgetMs(platform) + identifyBudgetMs(platform) + (platform === 'win32' ? 0 : identifyBudgetMs(platform));
 
 /**
  * What a thread that entered claimLock beside the claimant waits through until the claim commits, step by step.
@@ -466,8 +468,9 @@ function claimantPath(platform) {
 		['a round in the gate that ends "cannot tell"', gateHold(platform)],
 		['the claimant finding the gate free, one check of its holder late', alive],
 		["the claimant's own round, which publishes the unfinished claim", gateHold(platform)],
-		["launchReaper's first spawn", spawn],
-		['its second spawn, under the other command', spawn],
+		["the first spawn, of the reaper or of a keeper's launcher", spawn],
+		['the second, under the other command', spawn],
+		['a keeper and its launcher starting before the keeper commits', keeperBootMs(platform)],
 		['the commit waiting on the gate', gateWaitMs(platform)],
 		["its last check of the gate's holder", alive],
 		[

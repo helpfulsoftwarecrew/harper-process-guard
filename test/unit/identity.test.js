@@ -2,7 +2,7 @@
 // Identification decides what may be signalled, so every case here is about what the guard is allowed
 // to conclude, not about what it happens to read.
 import assert from 'node:assert/strict';
-import { execSync } from 'node:child_process';
+import { execFileSync, execSync } from 'node:child_process';
 import fs from 'node:fs';
 import test from 'node:test';
 
@@ -16,7 +16,17 @@ import {
 	probeCim,
 	windowsCommandLine,
 } from '../../src/identity.js';
-import { deadPid, fixture, pidOf, readyLine, skipOnWindows, waitFor, WINDOWS, withSpawn } from '../support/harness.js';
+import {
+	deadPid,
+	fixture,
+	KEEPER_SCRIPT,
+	pidOf,
+	readyLine,
+	skipOnWindows,
+	waitFor,
+	WINDOWS,
+	withSpawn,
+} from '../support/harness.js';
 
 // Harper's vm-current-context sandbox substitutes node:child_process with only these five names;
 // execFileSync isn't one, and a real Harper node refuses to load a component that imports it.
@@ -65,6 +75,47 @@ test('two node scripts are told apart by argv, which is the only thing that sepa
 		assert.equal(identify(pidOf(a), [process.execPath]), 'match');
 		assert.equal(identify(pidOf(b), [process.execPath]), 'match');
 	}));
+
+test('a command line holding non-ASCII identifies as itself, as a home directory or install path can', () =>
+	withSpawn(async ({ spawn }) => {
+		const argv = [process.execPath, fixture('idle.js'), `/Users/José/hdb/café-${process.pid}`];
+		const child = spawn(process.execPath, argv.slice(1), { stdio: 'ignore' });
+		await waitFor(() => argvOf(pidOf(child)) !== null, 'the child to appear in the process table');
+		assert.equal(identify(pidOf(child), argv), 'match');
+	}));
+
+test('a reader whose locale is broken, foreign or unset, in another zone, reads the same command line and start time', (t) => {
+	if (skipOnWindows(t, 'win32 reads its command lines through no locale and records no start time')) return;
+	return withSpawn(async ({ spawn }) => {
+		const { startedAt } = await import('../../src/identity.js');
+		const argv = [process.execPath, fixture('idle.js'), `/Users/José/hdb/café-${process.pid}`];
+		const child = spawn(process.execPath, argv.slice(1), { stdio: 'ignore' });
+		await waitFor(() => argvOf(pidOf(child)) !== null, 'the child to appear in the process table');
+		const started = startedAt(pidOf(child));
+		assert.equal(typeof started, 'string', 'no start time was read here');
+		const script =
+			`const { identify, startedAt } = await import(${JSON.stringify(new URL('../../src/identity.js', import.meta.url).href)});` +
+			'const [pid, argv] = [Number(process.argv[1]), JSON.parse(process.argv[2])];' +
+			'console.log(JSON.stringify({ verdict: identify(pid, argv), started: startedAt(pid) }));';
+		const bare = Object.fromEntries(
+			Object.entries(process.env).filter(([key]) => key !== 'LANG' && !key.startsWith('LC_'))
+		);
+		for (const locale of [
+			{},
+			{ LANG: 'garbage' },
+			{ LANG: 'de_DE.UTF-8', LC_MESSAGES: 'garbage' },
+			{ LC_ALL: 'de_DE.UTF-8' },
+		]) {
+			const env = { ...bare, ...locale, TZ: 'Asia/Tokyo' };
+			const answer = execFileSync(
+				process.execPath,
+				['--input-type=module', '-e', script, String(pidOf(child)), JSON.stringify(argv)],
+				{ env, encoding: 'utf-8' }
+			);
+			assert.deepEqual(JSON.parse(answer), { verdict: 'match', started }, `read with ${JSON.stringify(locale)}`);
+		}
+	});
+});
 
 test('a leading run matches, and pinning more of the command line can only narrow the verdict', () =>
 	withSpawn(async ({ spawn }) => {
@@ -118,6 +169,87 @@ test('a zombie is not alive: it holds its pid and answers kill(pid, 0), but runs
 		}
 		assert.equal(holdsPid, true, 'the corpse was reaped before it could be observed');
 		assert.equal(isAlive(zombie), false);
+	});
+});
+
+test('a pid whose parent is the keeper its lock names is ours whatever it runs, and pid 1 vouches for no orphan', async (t) => {
+	if (skipOnWindows(t, 'no keeper runs on win32, and its probe reads no parent')) return;
+	// Imported here so this file still loads against a source tree without it.
+	const { identifyKept } = await import('../../src/identity.js');
+	const elsewhere = ['/opt/agent/bin/agent', 'run'];
+	// This process stands in for the keeper, so its own command line is what the lock would record.
+	const self = /** @type {string[]} */ (argvOf(process.pid));
+	await withSpawn(async ({ spawn }) => {
+		const child = spawn(process.execPath, [fixture('idle.js'), 'kept-by-this-process'], { stdio: 'ignore' });
+		await waitFor(() => argvOf(pidOf(child)) !== null, 'the child to appear in the process table');
+		assert.equal(identify(pidOf(child), elsewhere), 'differs');
+		assert.equal(identifyKept(pidOf(child), elsewhere, process.pid, self), 'match', 'its parent did not vouch for it');
+		assert.equal(
+			identifyKept(pidOf(child), elsewhere, await deadPid(), self),
+			'differs',
+			'a pid not its parent vouched'
+		);
+		assert.equal(identifyKept(pidOf(child), elsewhere, undefined, self), 'differs');
+		assert.equal(identifyKept(await deadPid(), elsewhere, process.pid, self), 'differs', 'a dead pid was vouched for');
+
+		const shell = spawn(
+			'/bin/sh',
+			['-c', `'${process.execPath}' '${fixture('idle.js')}' orphaned >/dev/null 2>&1 & echo $!`],
+			{
+				stdio: ['ignore', 'pipe', 'ignore'],
+			}
+		);
+		const orphan = Number(await readyLine(shell));
+		try {
+			await waitFor(() => !isAlive(pidOf(shell)), 'the shell to exit and leave its child to init');
+			assert.equal(identifyKept(orphan, elsewhere, 1, argvOf(1) ?? []), 'differs', 'init vouched for an orphan');
+		} finally {
+			process.kill(orphan, 'SIGKILL');
+		}
+	});
+});
+
+test('NEGATIVE: a parent that is not running the keeper its lock records vouches for nothing, as after pid reuse', async (t) => {
+	if (skipOnWindows(t, 'no keeper runs on win32, and its probe reads no parent')) return;
+	const { identifyKept } = await import('../../src/identity.js');
+	const elsewhere = ['/opt/agent/bin/agent', 'run'];
+	const keeperArgv = [process.execPath, KEEPER_SCRIPT, '--keep', '--lock', '/nowhere/agent.pid', '--token', 'gone'];
+	await withSpawn(async ({ spawn }) => {
+		const child = spawn(process.execPath, [fixture('idle.js'), 'child-of-a-stranger'], { stdio: 'ignore' });
+		await waitFor(() => argvOf(pidOf(child)) !== null, 'the child to appear in the process table');
+		assert.equal(
+			identifyKept(pidOf(child), elsewhere, process.pid, keeperArgv),
+			'differs',
+			'a reused keeper pid vouched'
+		);
+		assert.equal(
+			identifyKept(pidOf(child), elsewhere, process.pid, []),
+			'differs',
+			'a keeper with no command line vouched'
+		);
+		assert.equal(
+			identifyKept(pidOf(child), [process.execPath], process.pid, keeperArgv),
+			'match',
+			'its own argv stopped counting'
+		);
+	});
+});
+
+test('a pid that started when its lock records is that process whatever it now runs, and no other start time is', async (t) => {
+	if (skipOnWindows(t, 'no keeper runs on win32, so no lock there records a start time')) return;
+	const { identifyKept, startedAt } = await import('../../src/identity.js');
+	const elsewhere = ['/opt/agent/bin/agent', 'run'];
+	await withSpawn(async ({ spawn }) => {
+		const child = spawn(process.execPath, [fixture('idle.js'), 'started-at'], { stdio: 'ignore' });
+		await waitFor(() => argvOf(pidOf(child)) !== null, 'the child to appear in the process table');
+		const started = startedAt(pidOf(child));
+		assert.equal(typeof started, 'string', 'no start time was read');
+		assert.equal(startedAt(pidOf(child)), started, 'a second read disagreed with the first');
+		assert.equal(identifyKept(pidOf(child), elsewhere, undefined, [], started ?? ''), 'match');
+		assert.equal(identifyKept(pidOf(child), elsewhere, undefined, [], `${started} `), 'differs');
+		assert.equal(identifyKept(pidOf(child), elsewhere, undefined, []), 'differs', 'no recorded start time matched');
+		assert.equal(identifyKept(await deadPid(), elsewhere, undefined, [], started ?? ''), 'differs');
+		assert.equal(startedAt(await deadPid()), null);
 	});
 });
 
