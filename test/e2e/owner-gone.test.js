@@ -38,6 +38,8 @@ const NO_RELAY =
 const NO_HELD_STDIN =
 	'no keeper runs on win32, so a piped stdin there is the thread that spawned the process, and reads ' +
 	'end-of-file once that thread is gone, which README.md says.';
+/** 2 MiB of the talker's 32 KiB rounds. A relay that stopped draining let 9 through on Linux and 5 on macOS. */
+const ROUNDS_PAST_THE_BUFFERS = 64;
 
 /** @param {string} name @param {string[]} argv @returns {import('../../src/supervise.js').Descriptor} */
 const descriptor = (name, argv) => ({
@@ -181,14 +183,13 @@ test('a process whose output its thread reads through a pipe outlives that threa
 					await worker.terminate();
 					await settle(100);
 					const before = rounds();
+					const since = () => rounds() - before;
 
-					// About 50 rounds of 32 KiB each with no reader left, which fills any pipe nothing drains.
-					await settle(1000);
+					// A count, not a rate: a loaded macOS runner wrote 14 rounds in the second this once allowed.
+					await waitFor(() => since() >= ROUNDS_PAST_THE_BUFFERS, 'the process to go on writing', {
+						timeoutMs: slow(30_000),
+					}).catch(() => assert.fail(`the process stalled on a pipe nothing reads: ${since()} rounds`));
 					assert.equal(identify(pid, argv), 'match', 'the process died once the thread reading it was gone');
-					assert.ok(
-						rounds() - before >= 20,
-						`the process stalled on a pipe nothing reads: ${rounds() - before} rounds`
-					);
 					assert.equal(countRunning(argv), 1);
 					assert.equal(joiner.exited, false, 'the joiner saw a death');
 					assert.equal(joiner.restarts, 0);

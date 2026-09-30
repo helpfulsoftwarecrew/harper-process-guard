@@ -2,9 +2,12 @@
 import fs from 'node:fs';
 
 const chunk = Buffer.alloc(1 << 14, '.');
+const progress = process.argv[2] ?? '';
 let rounds = 0;
 setInterval(() => {
 	fs.writeSync(1, chunk);
 	fs.writeSync(2, chunk);
-	fs.writeFileSync(process.argv[2] ?? '', String((rounds += 1)));
+	// Replaced whole, since a file rewritten in place reads empty to a reader that lands between truncate and write.
+	fs.writeFileSync(`${progress}.tmp`, String((rounds += 1)));
+	fs.renameSync(`${progress}.tmp`, progress);
 }, 20);
