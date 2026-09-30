@@ -114,6 +114,17 @@ test('a fresh verdict is not retaken', async () => {
 	assert.equal(verdict.verified, true);
 });
 
+test('NEGATIVE: nothing is retaken for a process that has exited, whose verdict its supervisor dropped', async () => {
+	let polled = 0;
+	const stopped = { name: 'datadog-agent', started: true, exited: true, restarts: 0, pid: 300, verified: undefined };
+	const verdict = await retakeVerdict(stopped, async () => {
+		polled++;
+		return { ok: true, detail: 'a probe of nothing' };
+	});
+	assert.equal(polled, 0, 'a process that has exited was probed');
+	assert.equal(verdict.verified, undefined);
+});
+
 test('NEGATIVE: nothing is retaken for a process this thread never started', async () => {
 	let polled = 0;
 	const state = { name: 'x', started: false, error: 'no binary', restarts: 0, verifiedPid: 100, pid: 200 };

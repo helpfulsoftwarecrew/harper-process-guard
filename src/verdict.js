@@ -68,6 +68,8 @@ export const RETAKE_INTERVAL_MS = 10_000;
 function retakeReason(state, now, intervalMs) {
 	// A process this thread never started has no proof to retake; anything answering its port is a stranger.
 	if (state?.started === false) return null;
+	// Nor one that has exited: a probe then polls something that is not running, and its verdict would outlive it.
+	if (state?.exited === true) return null;
 	if (staleVerdict(state)) return 'restarted';
 	// A thread whose own spawn was refused carries the node's process and no verdict, and publishing
 	// "unverified" for that is the refusal masquerading as health.

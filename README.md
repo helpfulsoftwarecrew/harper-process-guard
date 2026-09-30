@@ -53,7 +53,7 @@ Any subset of a host's threads may make the call, the main thread among them, an
 | `claimTimeoutMs` | `47000`  | How long a claim waits on another thread's unfinished one. `146000` on Windows, as below.        |
 | `reaper`         | none     | `name`, `graceMs` (8000), `replacementPidFile`, `logFile`, `spawnOptions`. No reaper without it. |
 
-`verify` runs once everything is up, reaper included, and its verdict lands on the state.
+`verify` runs once everything is up, reaper included, and its verdict lands on the state. A death that nothing restarts, a deliberate stop among them, drops the verdict again, so a status read reports no proof about a process that has gone.
 
 ## What it does
 

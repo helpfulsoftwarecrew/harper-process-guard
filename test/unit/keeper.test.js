@@ -10,7 +10,7 @@ import { pathToFileURL } from 'node:url';
 import { Worker } from 'node:worker_threads';
 
 import { argvOf, identify, isAlive } from '../../src/identity.js';
-import { guard } from '../../src/index.js';
+import { guard, retakeVerdict, takeVerdictAgainst } from '../../src/index.js';
 import { claimLock, lockPath, readLock } from '../../src/lock.js';
 import { nodeProcess } from '../../src/node.js';
 import { reapTarget, run } from '../../src/reaper.js';
@@ -551,6 +551,41 @@ test('a death after its lock was removed is not restarted, which is the order th
 				assert.equal(calls.length, 1, 'a thread restarted a process whose lock was removed');
 			} finally {
 				ctx.run.stopping = true;
+			}
+		})
+	);
+});
+
+test('NEGATIVE: after a stop under a keeper, no thread reports the process as started or carries a verdict about it', (t) => {
+	if (skipOnWindows(t, NO_KEEPER)) return;
+	return withTempDir('guard-keep-', (dir) =>
+		withSpawn(async ({ spawn }) => {
+			const descriptor = descriptorFor('stopped-verified', 'idle.js');
+			// One thread starts it and one joins, each verified the way guard() records a caller's verdict.
+			const contexts = [keptContext(dir, spawn), keptContext(dir, spawn)];
+			try {
+				/** @type {import('../../src/supervise.js').ProcessState[]} */
+				const states = [];
+				for (const ctx of contexts) states.push(await superviseProcess(ctx, descriptor));
+				assert.equal(states[1]?.adopted, true, 'the second thread started its own copy rather than join the first');
+				for (const state of states)
+					Object.assign(takeVerdictAgainst(state), { verified: true, verifyDetail: 'answered' });
+
+				process.kill(states[0]?.pid ?? 0, 'SIGTERM');
+				await waitFor(() => states.every((state) => state.exited), 'every thread to see the stop');
+				await settle(150);
+				assert.equal(countRunning(descriptor.argv), 0, 'the stop was not honoured');
+				for (const [index, state] of states.entries()) {
+					assert.equal(state.verified, undefined, `thread ${index} keeps a verdict about a process that has gone`);
+					// What a status read makes of it, through the two calls a consumer's endpoint makes.
+					const read = await retakeVerdict(nodeProcess(state, dir), async () =>
+						assert.fail('a stopped process was probed')
+					);
+					assert.equal(read.started, false, `thread ${index} reports the stopped process as started`);
+					assert.notEqual(read.verified, true, `thread ${index} reads the stopped process as verified`);
+				}
+			} finally {
+				for (const ctx of contexts) ctx.run.stopping = true;
 			}
 		})
 	);

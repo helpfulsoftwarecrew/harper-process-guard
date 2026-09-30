@@ -64,6 +64,8 @@ export const DEFAULT_TUNING = { deathPollMs: 2000, restartMax: 5, restartBaseMs:
  * @property {string | undefined} [error]
  * @property {boolean} [verified] Set from the caller's verify().
  * @property {string | undefined} [verifyDetail]
+ * @property {number | null} [verifiedPid] The pid a verdict was taken against, which verdict.js records.
+ * @property {number} [verifiedAt] When the last verdict was retaken, which verdict.js records.
  * @property {number | undefined} [code] Exit code of the last death, from its keeper or from a child this thread spawned.
  * @property {string | undefined} [signal] Signal that ended the last death, from the same two sources.
  */
@@ -527,6 +529,19 @@ async function keeperRecord(path, kept, pid) {
 }
 
 /**
+ * A death nothing here replaces leaves no verdict: what a proof said was about a process that has gone. `started` and
+ * the pid stay beside `exited`, which is how a caller tells a process that ran and ended from one that never ran.
+ *
+ * @param {ProcessState} state
+ */
+function forgetVerdict(state) {
+	delete state.verified;
+	delete state.verifyDetail;
+	delete state.verifiedPid;
+	delete state.verifiedAt;
+}
+
+/**
  * Answer a death from the keeper's record of it. False leaves the death to the lock, which is how a thread
  * answers one no keeper recorded.
  *
@@ -538,6 +553,7 @@ async function answerKept(ctx, descriptor, state, record, kept, lockHost) {
 	const cause = causeOf(record);
 	Object.assign(state, endedBy(record));
 	const hint = cause.startsWith('exit code') && descriptor.exitHint ? ` ${descriptor.exitHint}` : '';
+	if (record.outcome !== 'restarting') forgetVerdict(state);
 	if (record.outcome === 'released') {
 		if (record.error) {
 			state.error = `the ${descriptor.name} lock could not be released after a deliberate stop: ${record.error}`;
@@ -652,6 +668,7 @@ async function answerDeath(ctx, descriptor, state, restarts, death, token, lockH
 	if (record && kept && (await answerKept(ctx, descriptor, state, record, kept, lockHost))) return;
 	// An orphan's exit status reaches nobody, so this death may be a stop, and a restart would fight it.
 	if (kept && !record && identify(kept.keeper, kept.keeperArgv) === 'differs') {
+		forgetVerdict(state);
 		state.error = `died with its keeper (pid ${kept.keeper}) gone, so nothing could read how it ended`;
 		ctx.log.warn(
 			`process guard: the ${state.title} (pid ${state.pid}) ${state.error}. It may have been stopped on ` +
@@ -674,6 +691,7 @@ async function answerByLock(ctx, descriptor, state, restarts, cause, token, lock
 	const hint = cause.startsWith('exit code') && descriptor.exitHint ? ` ${descriptor.exitHint}` : '';
 
 	if (token !== null && isDeliberate(cause)) {
+		forgetVerdict(state);
 		// This guard sends SIGTERM itself when it stops an orphan, so a signal alone cannot tell an operator
 		// from a sibling thread. The lock can: another token holds it only because that thread took it first.
 		const holder = readLock(path);
@@ -697,6 +715,7 @@ async function answerByLock(ctx, descriptor, state, restarts, cause, token, lock
 	// The lock goes two ways: its holder releases it on a deliberate stop, and a reaper removes it when the
 	// holder's host dies. Only that host tells them apart, and a dead one has left this death unanswered.
 	if (token === null && !existsSync(path) && isAlive(lockHost)) {
+		forgetVerdict(state);
 		ctx.log.info(
 			`process guard: the ${state.title} (pid ${state.pid}) is gone (${cause}) and its lock with it. Host ` +
 				`${lockHost} held that lock and is still running, so it has answered this death; this thread is not ` +
@@ -705,6 +724,7 @@ async function answerByLock(ctx, descriptor, state, restarts, cause, token, lock
 		return;
 	}
 	if (restarts + 1 > ctx.tuning.restartMax) {
+		forgetVerdict(state);
 		state.error = `died ${restarts + 1} times (${cause}); not restarting it again`;
 		ctx.log.error(
 			`process guard: the ${state.title} ${state.error}. What it provided is missing from this node ` +
