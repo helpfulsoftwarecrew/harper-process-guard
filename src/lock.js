@@ -198,44 +198,69 @@ function takeGate(path) {
 		unlinkQuietly(temp);
 	}
 
-	/** @type {number | null} */
-	let holder = null;
-	try {
-		holder = Number.parseInt(readFileSync(gate, 'utf-8'), 10);
-	} catch {
-		// Unreadable is "cannot tell", never "not ours": clearing on a failed read takes a gate a second
-		// thread has since linked.
-		return null;
-	}
+	const seen = lookAt(gate);
+	if (seen === null) return null;
 	// A gate whose holder is dead is not a gate, and one older than any hold is a holder stuck inside. How long this
 	// caller has waited says nothing: broken on that, a gate another thread had taken half a second before went.
-	if (!isAlive(holder) || ageOf(gate) >= GATE_WAIT_MS) unlinkQuietly(gate);
+	// One this caller cannot read is judged by its age alone, which stat reads without read permission.
+	const deadHolder = seen.text !== null && !isAlive(Number.parseInt(seen.text, 10));
+	if (!deadHolder && Date.now() - seen.mtimeMs < GATE_WAIT_MS) return null;
+	// Removed only while it is still the gate judged: the liveness check can fork a `ps`, and a waiter that broke
+	// the same gate and took its own meanwhile had that one removed, 4 and 6 rounds in 200.
+	if (sameGate(lookAt(gate), seen)) unlinkQuietly(gate);
 	return null;
 }
 
+/** @typedef {{ ino: number, mtimeMs: number, text: string | null }} GateLook One look at a gate; `text` null when unreadable. */
+
+/** The gate as it is now, or null once it has gone. @param {string} gate @returns {GateLook | null} */
+function lookAt(gate) {
+	try {
+		const { ino, mtimeMs } = statSync(gate);
+		/** @type {string | null} */
+		let text = null;
+		try {
+			text = readFileSync(gate, 'utf-8');
+		} catch {
+			// Unreadable, which leaves its age to judge it.
+		}
+		return { ino, mtimeMs, text };
+	} catch {
+		return null;
+	}
+}
+
+/** Whether two looks saw one gate: a gate taken since has another inode, mtime and mark. @param {GateLook | null} a @param {GateLook} b */
+const sameGate = (a, b) => a !== null && a.ino === b.ino && a.mtimeMs === b.mtimeMs && a.text === b.text;
+
+/** What a decision returns instead of acting once its gate is no longer its own; the caller looks again. */
+const STALE = Symbol('stale');
+
 /**
- * Hold the gate for `decide`, which must not await: the gate blocks every other thread's view of this lock.
- * null means it was not free.
+ * Hold the gate for `decide`, which must not await: the gate blocks every other thread's view of this lock. `decide`
+ * gets `own`, which it checks right before any write and returns STALE on failure. null means the gate was not free.
  *
  * @template T
- * @param {string} path @param {() => T} decide @returns {T | null}
+ * @param {string} path @param {(own: () => boolean) => T | typeof STALE} decide @returns {T | null}
  */
 function underGate(path, decide) {
 	const mark = takeGate(path);
 	if (mark === null) return null;
+	const gate = `${path}${GATE_SUFFIX}`;
+	const own = () => {
+		try {
+			return readFileSync(gate, 'utf-8') === mark;
+		} catch {
+			return false;
+		}
+	};
 	try {
-		return decide();
+		const decided = decide(own);
+		return decided === STALE ? null : decided;
 	} finally {
 		// Only this holder's own gate: one broken while this holder was stuck is the breaker's now, and removing
 		// it let a third thread in beside the breaker.
-		const gate = `${path}${GATE_SUFFIX}`;
-		let current = null;
-		try {
-			current = readFileSync(gate, 'utf-8');
-		} catch {
-			// Gone already.
-		}
-		if (current === mark) unlinkQuietly(gate);
+		if (own()) unlinkQuietly(gate);
 	}
 }
 
@@ -340,11 +365,13 @@ export async function claimLock({ pidDir, name, version, argv, timeoutMs = CLAIM
 
 	for (;;) {
 		const expired = Date.now() >= deadline;
-		const verdict = underGate(path, () => {
+		const verdict = underGate(path, (own) => {
 			const held = readLock(path);
 			const claimAgeMs = held?.pid === 0 ? ageOf(path) : 0;
 			const decision = adjudicate(held, { name, version, argv, stopOrphans, expired, notes, claimAgeMs, timeoutMs });
 			if (decision.act !== 'take') return decision;
+			// A holder stopped past the gate's age acted on what it read before the stop, over a claim committed since.
+			if (!own()) return STALE;
 			// Inside the gate, so no sibling reads a dying pid and adopts a corpse. publish signals itself,
 			// which keeps that ahead of the write erasing the pid.
 			publish(path, { pid: 0, version, token, host: process.pid, argv }, decision.stop);
@@ -370,9 +397,10 @@ export async function claimLock({ pidDir, name, version, argv, timeoutMs = CLAIM
  * @returns {Promise<WriteOutcome>}
  */
 export function commitLock(path, token, pid, version, argv, owner = undefined) {
-	return writeUnderGate(path, (held) => {
+	return writeUnderGate(path, (held, own) => {
 		if (held === null) return 'gone';
 		if (held.token !== token) return 'taken';
+		if (!own()) return STALE;
 		publish(path, { pid, version, token, argv, host: process.pid, ...owner });
 		return 'written';
 	});
@@ -387,10 +415,12 @@ export function commitLock(path, token, pid, version, argv, owner = undefined) {
  * @returns {Promise<WriteOutcome>}
  */
 export function releaseLock(path, token, beforeRemoving = undefined) {
-	return writeUnderGate(path, (held) => {
+	return writeUnderGate(path, (held, own) => {
 		if (held === null) return 'gone';
 		if (held.token !== token) return 'taken';
+		if (!own()) return STALE;
 		beforeRemoving?.();
+		if (!own()) return STALE;
 		unlinkQuietly(path);
 		return 'written';
 	});
@@ -403,10 +433,11 @@ export function releaseLock(path, token, beforeRemoving = undefined) {
  * @param {string} path @param {string} token @returns {Promise<WriteOutcome | Lock>}
  */
 export function releaseUnstarted(path, token) {
-	return writeUnderGate(path, (held) => {
+	return writeUnderGate(path, (held, own) => {
 		if (held === null) return 'gone';
 		if (held.token !== token) return 'taken';
 		if (held.pid > 0) return held;
+		if (!own()) return STALE;
 		unlinkQuietly(path);
 		return 'written';
 	});
@@ -421,10 +452,12 @@ export function releaseUnstarted(path, token) {
  * @returns {Promise<{ held: Lock, decision: T } | { held: null }>} `held` is null when no lock of the guard's was there.
  */
 export function removeLock(path, decide) {
-	return writeUnderGate(path, (held) => {
+	return writeUnderGate(path, (held, own) => {
 		// Never null itself: underGate reads null as a gate that was not free.
 		if (held === null || held.token === '' || held.argv.length === 0) return { held: null };
 		const decision = decide(held);
+		// A reaper stopped inside this gate past its age removed a lock a new host had committed meanwhile.
+		if (!own()) return STALE;
 		unlinkQuietly(path);
 		return { held, decision };
 	});
@@ -437,9 +470,10 @@ export function removeLock(path, decide) {
  * @param {string} path @param {number} pid @returns {Promise<{ outcome: WriteOutcome, pid: number }>}
  */
 export function releaseOwnLock(path, pid) {
-	return writeUnderGate(path, (held) => {
+	return writeUnderGate(path, (held, own) => {
 		if (held === null) return { outcome: /** @type {WriteOutcome} */ ('gone'), pid: 0 };
 		if (held.pid !== pid) return { outcome: /** @type {WriteOutcome} */ ('taken'), pid: held.pid };
+		if (!own()) return STALE;
 		unlinkQuietly(path);
 		return { outcome: /** @type {WriteOutcome} */ ('written'), pid };
 	}).catch((error) => {
@@ -469,12 +503,12 @@ export async function safeLockWrite(write) {
 	}
 }
 
-/** @template T @param {string} path @param {(held: Lock | null) => T} write @returns {Promise<T>} */
+/** @template T @param {string} path @param {(held: Lock | null, own: () => boolean) => T | typeof STALE} write @returns {Promise<T>} */
 async function writeUnderGate(path, write) {
 	// A gate is held across a liveness check and an identification at worst, and one older than that is broken
 	// by takeGate, so this waits on the gate's age rather than keeping a deadline of its own.
 	for (;;) {
-		const done = underGate(path, () => write(readLock(path)));
+		const done = underGate(path, (own) => write(readLock(path), own));
 		if (done !== null) return done;
 		await delay(GATE_RETRY_MS);
 	}

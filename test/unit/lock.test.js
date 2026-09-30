@@ -28,6 +28,7 @@ import {
 	readyLine,
 	seedLock,
 	settle,
+	skipAsRoot,
 	skipOnWindows,
 	slow,
 	waitFor,
@@ -378,20 +379,76 @@ test('NEGATIVE: a gate a live thread has just taken is not broken by a caller wh
 		assert.equal((await claim).outcome, 'won');
 	}));
 
-test("NEGATIVE: a holder whose gate was broken and taken while it was inside leaves the new holder's gate", () =>
-	withTempDir('guard-lock-', async (dir) => {
-		const file = lockPath(dir, 'broken-in');
-		const gate = `${file}.claiming`;
-		seedLock(file, { pid: process.pid, token: 'seeded', argv: ['/bin/thing'] });
-		// What another thread does to a holder stuck past the gate's age: removes its gate and takes one of its own.
-		await removeLock(file, () => {
+/**
+ * A gated write whose holder is stopped past the gate's age, standing in the stop with a breaker that takes the gate
+ * inside the holder's own step on its first pass and leaves 100 ms later. Resolves to what the breaker saw on its way
+ * out, and how many passes the holder made.
+ *
+ * @param {string} gate @param {string} lock @param {(step: () => void) => Promise<unknown>} write
+ */
+async function brokenWhileStopped(gate, lock, write) {
+	let passes = 0;
+	/** @type {(value: { lock: boolean, gate: string }) => void} */
+	let left = () => {};
+	const breakerLeft = new Promise((resolve) => (left = resolve));
+	const step = () => {
+		passes += 1;
+		if (passes > 1) return;
+		// What another thread does to a holder stopped past the gate's age: removes its gate and takes one of its own.
+		fs.unlinkSync(gate);
+		fs.writeFileSync(gate, `${process.pid} another holder`, 'utf-8');
+		setTimeout(() => {
+			const seen = { lock: fs.existsSync(lock), gate: fs.readFileSync(gate, 'utf-8') };
 			fs.unlinkSync(gate);
-			fs.writeFileSync(gate, `${process.pid} another holder`, 'utf-8');
-			return true;
-		});
-		assert.equal(fs.existsSync(gate), true, 'the stuck holder removed the gate its breaker now holds');
-		assert.equal(fs.readFileSync(gate, 'utf-8'), `${process.pid} another holder`);
+			left(seen);
+		}, 100);
+	};
+	const [seen] = await Promise.all([breakerLeft, write(step)]);
+	return { seen, passes };
+}
+
+test("NEGATIVE: a holder stopped past the gate's age acts on nothing it read before, and leaves its breaker's gate", () =>
+	withTempDir('guard-lock-', async (dir) => {
+		// A reaper stopped inside removeLock's gate removed a lock a new host had committed meanwhile: two copies.
+		const removed = lockPath(dir, 'removed');
+		seedLock(removed, { pid: process.pid, token: 'seeded', argv: ['/bin/thing'] });
+		const removal = await brokenWhileStopped(`${removed}.claiming`, removed, (step) =>
+			removeLock(removed, () => step())
+		);
+		assert.deepEqual(removal.seen, { lock: true, gate: `${process.pid} another holder` }, 'the stopped reaper acted');
+		assert.equal(removal.passes, 2, 'the stopped reaper did not look again once its gate was free');
+		assert.equal(fs.existsSync(removed), false);
+
+		// A keeper stopped inside releaseLock's gate, between its record and its removal, the same way.
+		const released = lockPath(dir, 'released');
+		seedLock(released, { pid: process.pid, token: 'kept', argv: ['/bin/thing'] });
+		const release = await brokenWhileStopped(`${released}.claiming`, released, (step) =>
+			releaseLock(released, 'kept', () => step())
+		);
+		assert.deepEqual(release.seen, { lock: true, gate: `${process.pid} another holder` }, 'the stopped keeper acted');
+		assert.equal(fs.existsSync(released), false);
 	}));
+
+test('NEGATIVE: a gate this process cannot read is still broken once it is older than any hold', (t) => {
+	if (
+		skipAsRoot(t, 'root reads a file whatever its mode, so no gate is unreadable to it and the age path goes untested')
+	)
+		return;
+	if (skipOnWindows(t, 'chmod on Windows sets only the read-only flag, so a gate cannot be made unreadable there'))
+		return;
+	return withTempDir('guard-lock-', async (dir) => {
+		// Another user's gate under a tight umask reads EACCES; returning on the failed read left it for good.
+		const gate = `${lockPath(dir, 'unreadable')}.claiming`;
+		fs.writeFileSync(gate, `${await deadPid()}`, 'utf-8');
+		const then = (Date.now() - gateWaitMs() - 1000) / 1000;
+		fs.utimesSync(gate, then, then);
+		fs.chmodSync(gate, 0o000);
+		const claim = claimLock({ pidDir: dir, name: 'unreadable', version: 1, argv: ['/bin/thing'], timeoutMs: 200 });
+		const outcome = await Promise.race([claim.then((result) => result.outcome), settle(3000).then(() => 'pending')]);
+		assert.equal(outcome, 'won', 'an unreadable gate a minute past its age was never broken');
+		assert.equal(fs.existsSync(gate), false);
+	});
+});
 
 test('NEGATIVE: a claim taken over a moment ago is waited on by a caller whose budget ends just after, not taken again', () =>
 	withTempDir('guard-lock-', async (dir) =>
