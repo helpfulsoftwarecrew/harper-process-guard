@@ -218,6 +218,7 @@ export function clearStaleHostPidFiles(root, named, log, label = 'process guard'
 		if (!Number.isInteger(pid) || pid <= 0) continue;
 		const running = argvOf(pid);
 		if (running === null) continue;
+		// win32 reports one command line, not a vector, so the script is found inside it there.
 		const line = running.join(' ');
 		const carries = (/** @type {string} */ flag) =>
 			lock === undefined || line.includes(` ${flag} ${lock} `) || line.endsWith(` ${flag} ${lock}`);
@@ -227,7 +228,9 @@ export function clearStaleHostPidFiles(root, named, log, label = 'process guard'
 			(lock !== undefined && line.includes(KEEPER_SCRIPT) && carries('--lock')) ||
 			(argv
 				? identifyPid(pid, argv) === 'match'
-				: running.some((argument) => argument.endsWith(script ?? '\x00')) && carries('--self-lock'));
+				: (running.length === 1
+						? line.includes(script ?? '\x00')
+						: running.some((argument) => argument.endsWith(script ?? '\x00'))) && carries('--self-lock'));
 		if (ours) continue;
 		try {
 			unlinkSync(file);
