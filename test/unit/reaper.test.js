@@ -5,8 +5,10 @@ import fs from 'node:fs';
 import path from 'node:path';
 import test from 'node:test';
 
+import { fileURLToPath } from 'node:url';
+
 import { argvOf, isAlive } from '../../src/identity.js';
-import { lockPath } from '../../src/lock.js';
+import { lockPath, readLock } from '../../src/lock.js';
 import { collectTargets, parseArgs, reapTarget, replacementPid, run } from '../../src/reaper.js';
 import {
 	deadPid,
@@ -19,6 +21,8 @@ import {
 	withSpawn,
 	withTempDir,
 } from '../support/harness.js';
+
+const REAPER_SCRIPT = fileURLToPath(new URL('../../src/reaper.js', import.meta.url));
 
 /** @param {string} dir @param {Partial<import('../../src/reaper.js').ReaperOptions>} [overrides] */
 const options = (dir, overrides = {}) => ({ hostPid: process.pid, pidDir: dir, graceMs: 0, ...overrides });
@@ -137,7 +141,8 @@ test('when the host goes and nothing replaces it, everything it locked is stoppe
 			const guarded = await running(spawn, 'reaped');
 			seedLock(lockPath(dir, 'guarded'), { pid: guarded.pid, argv: guarded.argv });
 			const host = await running(spawn, 'the-host');
-			seedLock(lockPath(dir, 'self'), { pid: 1, argv: ['/bin/reaper'] });
+			// run() here is this process, so its own lock names this pid.
+			seedLock(lockPath(dir, 'self'), { pid: process.pid, argv: ['/bin/reaper'] });
 
 			host.child.kill('SIGKILL');
 			await waitFor(() => !isAlive(host.pid), 'the host to go');
@@ -148,6 +153,85 @@ test('when the host goes and nothing replaces it, everything it locked is stoppe
 			assert.equal(fs.existsSync(lockPath(dir, 'self')), false, 'the reaper left its own lock behind');
 		})
 	));
+
+test('NEGATIVE: a reaper leaves its lock to the newer reaper that took it, whether or not a host replaced its own', () =>
+	withTempDir('guard-reap-', (dir) =>
+		withSpawn(async ({ spawn }) => {
+			// A host that replaced this reaper's took the name for its own reaper, which the lock now names.
+			const newer = await running(spawn, 'the-newer-reaper');
+			const host = await running(spawn, 'the-old-host');
+			host.child.kill('SIGKILL');
+			await waitFor(() => !isAlive(host.pid), 'the old host to go');
+			const self = lockPath(dir, 'self');
+			const hostFile = path.join(dir, 'host.pid');
+			const reaper = (/** @type {string | undefined} */ replacementPidFile) =>
+				run(
+					options(dir, {
+						hostPid: host.pid,
+						graceMs: 50,
+						selfLock: self,
+						...(replacementPidFile ? { replacementPidFile } : {}),
+					})
+				);
+
+			seedLock(self, { pid: newer.pid, argv: newer.argv });
+			await reaper(undefined);
+			assert.equal(
+				readLock(self)?.pid,
+				newer.pid,
+				"a reaper whose host nothing replaced removed the newer reaper's lock"
+			);
+
+			const replacement = await running(spawn, 'the-new-host');
+			fs.writeFileSync(hostFile, `${replacement.pid}\n`);
+			await reaper(hostFile);
+			assert.equal(
+				readLock(self)?.pid,
+				newer.pid,
+				"a reaper handing over to a replacement removed the newer reaper's lock"
+			);
+
+			seedLock(self, { pid: process.pid, argv: ['/bin/reaper'] });
+			await reaper(hostFile);
+			assert.equal(fs.existsSync(self), false, 'a reaper handing over left its own lock behind');
+		})
+	));
+
+test('NEGATIVE: a reaper told to stop leaves its lock to the newer reaper that took it', (t) => {
+	if (skipOnWindows(t, 'a Windows process cannot be sent SIGTERM, so the reaper runs no handler there to test.'))
+		return;
+	return withTempDir('guard-reap-', (dir) =>
+		withSpawn(async ({ spawn }) => {
+			const self = lockPath(dir, 'self');
+			const log = path.join(dir, 'reaper.log');
+			const args = [
+				REAPER_SCRIPT,
+				'--host-pid',
+				String(process.pid),
+				'--pid-dir',
+				dir,
+				'--self-lock',
+				self,
+				'--log',
+				log,
+			];
+			const reaper = spawn(process.execPath, args, { stdio: 'ignore' });
+			const exited = new Promise((resolve) => reaper.once('exit', resolve));
+			// Its first log line proves the signal handler exists.
+			await waitFor(
+				() => fs.existsSync(log) && fs.readFileSync(log, 'utf-8').includes('watching pid'),
+				'the reaper to start'
+			);
+			const newer = await running(spawn, 'the-newer-reaper');
+			seedLock(self, { pid: newer.pid, argv: newer.argv });
+
+			reaper.kill('SIGTERM');
+			await exited;
+			assert.equal(readLock(self)?.pid, newer.pid, "a reaper told to stop removed the newer reaper's lock");
+			assert.match(fs.readFileSync(log, 'utf-8'), new RegExp(`its lock now names pid ${newer.pid}; left it`));
+		})
+	);
+});
 
 test('a replacement host inside the grace window keeps the processes for it to adopt', () =>
 	withTempDir('guard-reap-', (dir) =>

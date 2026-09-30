@@ -8,7 +8,7 @@ import { pathToFileURL } from 'node:url';
 
 import { identifyKept, isAlive, STOP_POLL_MS, waitWhileAlive } from './identity.js';
 import { errorMessage } from './exit.js';
-import { readLock, removeLock, unlinkQuietly } from './lock.js';
+import { readLock, releaseOwnLock, removeLock } from './lock.js';
 
 const DEFAULT_WATCH_POLL_MS = 1000;
 const DEFAULT_TERM_GRACE_MS = 5000;
@@ -121,6 +121,20 @@ export function replacementPid(options) {
 	return lock.pid;
 }
 
+/**
+ * This reaper's own lock, removed only while it names this reaper: a host that replaced this one's took the lock for
+ * its own reaper, and removing that left the node reporting none while one ran. @param {ReaperOptions} options
+ */
+async function releaseSelf(options) {
+	if (!options.selfLock) return;
+	try {
+		const released = await releaseOwnLock(options.selfLock, process.pid);
+		if (released.outcome === 'taken') log(options, `its lock now names pid ${released.pid}; left it to that reaper`);
+	} catch (error) {
+		log(options, `could not release its own lock: ${errorMessage(error)}`);
+	}
+}
+
 /** Exported so a test can drive it without spawning one. @param {ReaperOptions} options */
 export async function run(options) {
 	log(options, `watching pid ${options.hostPid}; will stop what is locked under ${options.pidDir} when it goes.`);
@@ -134,7 +148,7 @@ export async function run(options) {
 		const replacement = replacementPid(options);
 		if (replacement !== null) {
 			log(options, `pid ${replacement} took over inside the grace window; leaving the processes for it`);
-			if (options.selfLock) unlinkQuietly(options.selfLock);
+			await releaseSelf(options);
 			return;
 		}
 		await delay(100);
@@ -142,7 +156,7 @@ export async function run(options) {
 
 	// Enumerated now rather than at launch: a thread that joined this reaper later left its lock here too.
 	for (const target of collectTargets(options)) await reapTarget(options, target);
-	if (options.selfLock) unlinkQuietly(options.selfLock);
+	await releaseSelf(options);
 	log(options, 'done.');
 }
 
@@ -186,8 +200,7 @@ export function parseArgs(argv) {
  */
 function stopOnSignal(options, signal) {
 	log(options, `received ${signal}; leaving its own lock for a replacement and exiting.`);
-	if (options.selfLock) unlinkQuietly(options.selfLock);
-	process.exit(0);
+	releaseSelf(options).finally(() => process.exit(0));
 }
 
 // Executed directly, which is how a host uses this. Guarded so the exports above stay importable by a

@@ -225,6 +225,12 @@ test(
 					assert.notEqual(replacement, started.guarded, 'the lock still names the process that was stopped');
 					assert.equal(isAlive(replacement ?? -1), true, 'the lock names a replacement that is not running');
 					for (const host of survivors) assert.equal(isAlive(host.pid ?? -1), true, 'a survivor died on its own');
+					// A survivor took the reaper lock for its own reaper, and the killed host's reaper leaving must not remove it.
+					const reaper = readLock(lockPath(dir, 'reaper'))?.pid ?? 0;
+					assert.ok(
+						joined.some((result) => result.reaper.pid === reaper) && isAlive(reaper),
+						`the reaper lock names ${reaper || 'nothing'}, not a survivor's running reaper`
+					);
 				} finally {
 					// Killing the survivors leaves the replacement to their reapers, and waiting proves nothing stayed.
 					const left = readLock(lockPath(dir, 'guarded'))?.pid ?? 0;

@@ -407,6 +407,21 @@ export function removeLock(path, decide) {
 }
 
 /**
+ * A reaper's own lock, removed only while it still names `pid`, and what it named otherwise. A host after a restart
+ * takes the name for its own reaper, and the old reaper leaving removed that one's lock.
+ *
+ * @param {string} path @param {number} pid @returns {Promise<{ outcome: WriteOutcome, pid: number }>}
+ */
+export function releaseOwnLock(path, pid) {
+	return writeUnderGate(path, (held) => {
+		if (held === null) return { outcome: /** @type {WriteOutcome} */ ('gone'), pid: 0 };
+		if (held.pid !== pid) return { outcome: /** @type {WriteOutcome} */ ('taken'), pid: held.pid };
+		unlinkQuietly(path);
+		return { outcome: /** @type {WriteOutcome} */ ('written'), pid };
+	});
+}
+
+/**
  * Await a lock write that must not throw: every caller sits behind a fire-and-forget death handler or a catch
  * already reporting something else. A non-'written' outcome is as much a failure, and says which.
  *
