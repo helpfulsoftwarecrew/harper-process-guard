@@ -10,6 +10,7 @@ import path from 'node:path';
 import { argvOf, isAlive } from '../../src/identity.js';
 import { clearStaleHostPidFiles, REAPER_WATCH_MS, supervisorFor } from '../../src/index.js';
 import { lockPath, readLock } from '../../src/lock.js';
+import { runsScript } from '../../src/node.js';
 import { KEEPER_SCRIPT, pidOf, waitFor, withSpawn } from '../support/harness.js';
 import { withTempDir } from '../support/sandbox.js';
 import { captureLogs } from '../support/sandbox.js';
@@ -230,7 +231,9 @@ test("a reaper file naming this name's reaper stays, and one naming another name
 			const locks = path.join(root, 'locks');
 			const reaperOf = async (/** @type {string} */ name) => {
 				const lock = path.join(locks, `${name}.pid`);
-				const args = ['-e', 'setInterval(() => {}, 1 << 30)', '/x/src/reaper.js', '--self-lock', lock];
+				// This platform's separators, so a Windows leg reads the backslashed path a real reaper runs under.
+				const script = path.join(root, 'src', 'reaper.js');
+				const args = ['-e', 'setInterval(() => {}, 1 << 30)', script, '--self-lock', lock];
 				const standIn = spawn(process.execPath, args, { stdio: 'ignore' });
 				await waitFor(() => argvOf(pidOf(standIn)) !== null, 'the stand-in to appear in the process table');
 				write(root, name, pidOf(standIn));
@@ -254,6 +257,22 @@ test("a reaper file naming this name's reaper stays, and one naming another name
 			assert.equal(lines.length, 1);
 		})
 	));
+
+test("NEGATIVE: a reaper's win32 command line, one line of backslashed paths, is this name's reaper and no other's", () => {
+	// The shape CIM reports for a reaper the bundled supervisor started on a Windows runner.
+	const locks = 'C:\\Users\\RUNNER~1\\AppData\\Local\\Temp\\dd-hpid-a1b2c3\\locks';
+	const own = `${locks}\\datadog-agent-reaper.pid`;
+	const line = (/** @type {string} */ selfLock) => [
+		'C:\\hostedtoolcache\\windows\\node\\24.11.0\\x64\\node.exe ' +
+			'D:\\a\\app\\node_modules\\@helpfulsoftwarecrew\\harper-process-guard\\src\\reaper.js ' +
+			`--host-pid 4242 --pid-dir ${locks} --grace-ms 8000 --self-lock ${selfLock}`,
+	];
+	assert.equal(runsScript(line(own), '/reaper.js', '--self-lock', own), true, "this name's reaper was not recognised");
+	const other = `${locks}\\other-reaper.pid`;
+	assert.equal(runsScript(line(other), '/reaper.js', '--self-lock', own), false, "another name's reaper was taken");
+	const keeper = [`C:\\node.exe D:\\a\\app\\src\\keeper.js --keep --lock ${own} --token t -- C:\\agent.exe`];
+	assert.equal(runsScript(keeper, '/reaper.js', '--self-lock', own), false, 'a keeper was taken for the reaper');
+});
 
 test('no root, nothing to clear', async () => {
 	const lines = await captureLogs(() => clearStaleHostPidFiles(null, [{ name: 'x', argv: ['y'] }], console));

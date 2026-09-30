@@ -218,7 +218,7 @@ export function clearStaleHostPidFiles(root, named, log, label = 'process guard'
 		if (!Number.isInteger(pid) || pid <= 0) continue;
 		const running = argvOf(pid);
 		if (running === null) continue;
-		// win32 reports one command line, not a vector, so the script is found inside it there.
+		// win32 reports one command line, not a vector, so a keeper is found inside it there.
 		const line = running.join(' ');
 		const carries = (/** @type {string} */ flag) =>
 			lock === undefined || line.includes(` ${flag} ${lock} `) || line.endsWith(` ${flag} ${lock}`);
@@ -226,11 +226,7 @@ export function clearStaleHostPidFiles(root, named, log, label = 'process guard'
 		// file: another name's keeper that took the reaper's old pid had Harper hand it back as the reaper.
 		const ours =
 			(lock !== undefined && line.includes(KEEPER_SCRIPT) && carries('--lock')) ||
-			(argv
-				? identifyPid(pid, argv) === 'match'
-				: (running.length === 1
-						? line.includes(script ?? '\x00')
-						: running.some((argument) => argument.endsWith(script ?? '\x00'))) && carries('--self-lock'));
+			(argv ? identifyPid(pid, argv) === 'match' : runsScript(running, script ?? '\x00', '--self-lock', lock));
 		if (ours) continue;
 		try {
 			unlinkSync(file);
@@ -246,6 +242,22 @@ export function clearStaleHostPidFiles(root, named, log, label = 'process guard'
 			);
 		}
 	}
+}
+
+/**
+ * Whether a command line runs `script`, a path tail such as '/reaper.js', carrying `<flag> <lock>` when a lock is given.
+ * win32 reports one line with backslashed paths, so the script is compared with every separator a forward slash.
+ *
+ * @param {readonly string[]} running @param {string} script @param {string} flag @param {string | undefined} lock
+ */
+export function runsScript(running, script, flag, lock) {
+	const slashed = (/** @type {string} */ text) => text.replaceAll('\\', '/');
+	const line = running.join(' ');
+	if (lock !== undefined && !line.includes(` ${flag} ${lock} `) && !line.endsWith(` ${flag} ${lock}`)) return false;
+	const tail = slashed(script);
+	return running.length === 1
+		? slashed(line).includes(tail)
+		: running.some((argument) => slashed(argument).endsWith(tail));
 }
 
 /**
