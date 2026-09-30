@@ -77,7 +77,7 @@ jobs:
             const { version } = JSON.parse(require("node:fs").readFileSync("package.json", "utf8"));
             const identifier = version.split("-")[1]?.split(".")[0];
             if (identifier !== undefined && !/^[a-zA-Z][a-zA-Z0-9-]*$/.test(identifier)) {
-              console.log(`::error::Version ${version} has the numbered prerelease "${identifier}", which is what npm version prerelease writes without --preid. Name the prerelease (1.2.3-rc.0), then re-tag.`);
+              console.log(`::error::Version ${version} has the numbered prerelease "${identifier}", which is what npm version prerelease writes without --preid. Name the prerelease (2.0.0-beta.0), then re-tag.`);
               process.exit(1);
             }
             const tag = identifier === undefined ? "latest" : "next";
@@ -116,7 +116,7 @@ jobs:
             echo "latest already names $version for $name"
             exit 0
           fi
-          # sort -V ranks 1.0.0-rc.1 above 1.0.0, so it only ever compares two stable versions here.
+          # sort -V ranks 2.0.0-beta.1 above 2.0.0, so it only ever compares two stable versions here.
           case "$current" in
             '' | *-*) ;;
             *)
