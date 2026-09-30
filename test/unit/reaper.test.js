@@ -7,10 +7,11 @@ import test from 'node:test';
 
 import { fileURLToPath } from 'node:url';
 
-import { argvOf, isAlive } from '../../src/identity.js';
+import { argvOf, isAlive, startedAt } from '../../src/identity.js';
 import { claimLock, lockPath, readLock } from '../../src/lock.js';
 import { collectTargets, parseArgs, reapTarget, replacementPid, run } from '../../src/reaper.js';
 import {
+	anotherStart,
 	deadPid,
 	fixture,
 	pidOf,
@@ -91,6 +92,26 @@ test('an identified process is stopped, and its lock goes before the signal does
 			await reaping;
 			// kill(2) returns once the signal is queued, so the death is waited for rather than assumed.
 			await waitFor(() => !isAlive(pidOf(child)), 'the process that ignored SIGTERM to be escalated to SIGKILL and go');
+		})
+	);
+});
+
+test("NEGATIVE: a process running the lock's command line under another start time than the lock records is left alone", (t) => {
+	if (skipOnWindows(t, 'no keeper runs on win32, so no lock there records a start time')) return;
+	return withTempDir('guard-reap-', (dir) =>
+		withSpawn(async ({ spawn }) => {
+			// Another start of the same command, holding a pid the locked process once had.
+			const other = await running(spawn, 'same-command-another-start');
+			const started = startedAt(other.pid) ?? assert.fail('no start time was read');
+			seedLock(lockPath(dir, 'reused'), { pid: other.pid, argv: other.argv, started: anotherStart(started) });
+
+			await reapTarget(options(dir), collectTargets(options(dir))[0] ?? assert.fail('no target'));
+			assert.equal(fs.existsSync(lockPath(dir, 'reused')), false);
+			assert.equal(
+				isAlive(other.pid),
+				true,
+				'the reaper signalled a process that started after the one its lock records'
+			);
 		})
 	);
 });

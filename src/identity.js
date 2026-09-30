@@ -290,14 +290,16 @@ export function startedAt(pid) {
  *
  * @param {number} pid @param {readonly string[]} expected @param {number | undefined} keeper
  * @param {readonly string[]} keeperArgv The keeper's command line as its lock records it; empty vouches for nothing.
- * @param {string} [started] When the process started, as its keeper read it; a pid that still reads so is that process.
+ * @param {string} [started] When the process started, as its keeper read it; a pid reading another is not that process.
  * @returns {Verdict}
  */
 export function identifyKept(pid, expected, keeper, keeperArgv, started = undefined) {
 	const { alive, argv, ppid, started: actual } = inspect(pid);
 	if (!alive) return 'differs';
-	// A pid and its start time name one process, through any exec and after its keeper is gone.
+	// A pid and its start time name one process, through any exec and after its keeper is gone; another readable
+	// start time is another process under a reused pid, however alike its command line reads.
 	if (started && actual === started) return 'match';
+	if (started && actual !== null) return 'differs';
 	const verdict = compareArgv(argv, expected);
 	if (verdict === 'match' || keeper === undefined || keeper <= 1 || ppid !== keeper || keeperArgv.length === 0)
 		return verdict;

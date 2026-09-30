@@ -17,6 +17,7 @@ import {
 	windowsCommandLine,
 } from '../../src/identity.js';
 import {
+	anotherStart,
 	deadPid,
 	fixture,
 	KEEPER_SCRIPT,
@@ -250,6 +251,21 @@ test('a pid that started when its lock records is that process whatever it now r
 		assert.equal(identifyKept(pidOf(child), elsewhere, undefined, []), 'differs', 'no recorded start time matched');
 		assert.equal(identifyKept(await deadPid(), elsewhere, undefined, [], started ?? ''), 'differs');
 		assert.equal(startedAt(await deadPid()), null);
+	});
+});
+
+test('NEGATIVE: a pid whose readable start time is not the one its lock records is not ours, even running its command line', async (t) => {
+	if (skipOnWindows(t, 'no keeper runs on win32, so no lock there records a start time')) return;
+	const { identifyKept, startedAt } = await import('../../src/identity.js');
+	await withSpawn(async ({ spawn }) => {
+		// The same binary and arguments under a pid the lock's process once held: another start of the same command.
+		const argv = [process.execPath, fixture('idle.js'), 'same-command-another-start'];
+		const child = spawn(process.execPath, argv.slice(1), { stdio: 'ignore' });
+		await waitFor(() => argvOf(pidOf(child)) !== null, 'the child to appear in the process table');
+		const started = startedAt(pidOf(child)) ?? assert.fail('no start time was read');
+		assert.equal(identifyKept(pidOf(child), argv, undefined, []), 'match', 'the command line itself did not match');
+		assert.equal(identifyKept(pidOf(child), argv, undefined, [], anotherStart(started)), 'differs');
+		assert.equal(identifyKept(pidOf(child), argv, undefined, [], started), 'match');
 	});
 });
 

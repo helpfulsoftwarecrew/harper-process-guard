@@ -154,6 +154,9 @@ export function settle(ms) {
  * lock that must name a dead process for a whole test, since a freed pid can be issued again inside one. */
 export const UNISSUED_PID = 2 ** 22 + 1;
 
+/** Another readable start time than `started`, in the same form: its last number, one lower. @param {string} started */
+export const anotherStart = (started) => started.replace(/\d+$/, (last) => String(Number(last) - 1));
+
 /** A pid nothing holds: a real process, run to completion and reaped, so the number was genuinely issued. */
 export async function deadPid() {
 	const child = realSpawn(process.execPath, ['-e', '0'], { stdio: 'ignore' });
@@ -250,12 +253,16 @@ export function context(pidDir, spawn, overrides = {}) {
  * Written by hand rather than through the module under test, so a broken writer cannot seed a passing test.
  *
  * @param {string} file
- * @param {{ pid: number, version?: number, token?: string, host?: number, argv?: readonly string[], keeper?: number, keeperArgv?: readonly string[] }} lock
+ * @param {{ pid: number, version?: number, token?: string, host?: number, argv?: readonly string[], keeper?: number, keeperArgv?: readonly string[], started?: string }} lock
  */
-export function seedLock(file, { pid, version = 1, token = 'seeded', host = 1, argv = [], keeper, keeperArgv = [] }) {
+export function seedLock(
+	file,
+	{ pid, version = 1, token = 'seeded', host = 1, argv = [], keeper, keeperArgv = [], started }
+) {
 	fs.mkdirSync(path.dirname(file), { recursive: true });
 	const kept = keeper === undefined ? {} : { keeper, keeperArgv };
-	fs.writeFileSync(file, `${pid}\n${version}\n${JSON.stringify({ token, host, argv, ...kept })}\n`, 'utf-8');
+	const when = started === undefined ? {} : { started };
+	fs.writeFileSync(file, `${pid}\n${version}\n${JSON.stringify({ token, host, argv, ...kept, ...when })}\n`, 'utf-8');
 }
 
 /**
