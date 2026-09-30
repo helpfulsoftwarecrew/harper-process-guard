@@ -25,6 +25,7 @@ import {
 	waitFor,
 	withSpawn,
 	withTempDir,
+	withZombie,
 } from '../support/harness.js';
 
 /** @param {string} name @param {string} script @param {string[]} [args] @returns {import('../../src/supervise.js').Descriptor} */
@@ -73,6 +74,26 @@ test('NEGATIVE: a spawn that hands back a pid running something else is refused,
 			ctx.run.stopping = true;
 		}
 	}));
+
+// A pid file naming a process that died after its spawning thread ended: kill(pid, 0) still answers for the zombie.
+test('NEGATIVE: a spawn that hands back a zombie is refused, not recorded as started and then dead', (t) => {
+	if (skipOnWindows(t, 'Windows leaves no zombie to hand back.')) return;
+	return withTempDir('guard-sup-', (dir) =>
+		withZombie(async (zombie) => {
+			/** @type {import('../../src/supervise.js').Spawn} */
+			const zombieSpawn = () => /** @type {any} */ ({ pid: zombie, on() {}, once() {}, unref() {}, kill() {} });
+			const ctx = context(dir, zombieSpawn);
+			try {
+				const state = await superviseProcess(ctx, descriptorFor('one', 'idle.js'));
+				assert.equal(state.started, false, `the zombie was taken as the process: pid ${state.pid}`);
+				assert.match(state.error ?? '', new RegExp(`handed back pid ${zombie}, which has exited and was never reaped`));
+				assert.equal(fs.existsSync(lockPath(dir, 'one')), false, 'a refused start left its claim behind');
+			} finally {
+				ctx.run.stopping = true;
+			}
+		})
+	);
+});
 
 test('the thread that wins starts the process and records its pid on the lock', () =>
 	withTempDir('guard-sup-', (dir) =>

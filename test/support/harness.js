@@ -165,6 +165,27 @@ export async function deadPid() {
 	return child.pid;
 }
 
+/**
+ * A zombie for the length of `run`: a shell backgrounds a short sleep and execs into a long one, which never waits for
+ * it. The short one outlasts the exec, since a shell reaps a child that ends first. POSIX only; the parent is killed
+ * afterwards, and init reaps the orphan. @template T @param {(pid: number) => Promise<T>} run
+ */
+export async function withZombie(run) {
+	const parent = realSpawn('/bin/sh', ['-c', 'sleep 1 & echo $!; exec sleep 60'], {
+		stdio: ['ignore', 'pipe', 'ignore'],
+	});
+	try {
+		const pid = Number(await readyLine(parent));
+		await waitFor(
+			() => processTable().some((row) => row.pid === pid && row.stat.startsWith('Z')),
+			`pid ${pid} to exit unreaped`
+		);
+		return await run(pid);
+	} finally {
+		parent.kill('SIGKILL');
+	}
+}
+
 /** Lines by level, so a test can assert what was said rather than that something was. */
 export function captureLog() {
 	/** @type {{ info: string[], warn: string[], error: string[] }} */

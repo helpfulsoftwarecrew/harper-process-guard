@@ -4,7 +4,7 @@
 import { accessSync, constants, existsSync } from 'node:fs';
 import { setTimeout as delay } from 'node:timers/promises';
 
-import { aliveBudgetMs, argvOf, compareArgv, identify, identifyKept, isAlive } from './identity.js';
+import { aliveBudgetMs, argvOf, compareArgv, identify, identifyKept, isAlive, isZombie } from './identity.js';
 // Which exits mean somebody shut it down lives in exit.js, so this file and a consumer's status endpoint
 // cannot disagree about the same signal. Restarting into one of these fights the operator.
 import { describeSpawnFailure, errorMessage, isDeliberate } from './exit.js';
@@ -192,7 +192,14 @@ export function watchPid(ctx, pid) {
  */
 export function describeHandedBackPid(child, descriptor) {
 	const pid = child.pid ?? 0;
-	if (typeof child.spawnfile === 'string' || !isAlive(pid)) return undefined;
+	if (typeof child.spawnfile === 'string') return undefined;
+	// A host checking with kill(2) reads a zombie as running. Taken, it reads as started and then gone at once, every time.
+	if (isZombie(pid))
+		return (
+			`handed back pid ${pid}, which has exited and was never reaped. A host whose pid file outlived the ` +
+			`process's exit does this, and nothing runs under that pid to supervise.`
+		);
+	if (!isAlive(pid)) return undefined;
 	const running = argvOf(pid);
 	if (running === null || compareArgv(running, descriptor.argv) === 'match') return undefined;
 	return (

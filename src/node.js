@@ -6,7 +6,7 @@ import { readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { threadId } from 'node:worker_threads';
 
-import { argvOf, identify as identifyPid, identifyKept } from './identity.js';
+import { argvOf, identify as identifyPid, identifyKept, isZombie } from './identity.js';
 import { KEEPER_SCRIPT } from './keeper.js';
 import { readLock } from './lock.js';
 
@@ -217,7 +217,11 @@ export function clearStaleHostPidFiles(root, named, log, label = 'process guard'
 		}
 		if (!Number.isInteger(pid) || pid <= 0) continue;
 		const running = argvOf(pid);
-		if (running === null) continue;
+		if (running === null) {
+			// kill(2) reaches a zombie, so the host hands it back for every spawn under this name until the host exits.
+			if (isZombie(pid)) removeHostPidFile(file, name, pid, 'which has exited and was never reaped', log, label);
+			continue;
+		}
 		// win32 reports one command line, not a vector, so a keeper is found inside it there.
 		const line = running.join(' ');
 		const carries = (/** @type {string} */ flag) =>
@@ -228,19 +232,26 @@ export function clearStaleHostPidFiles(root, named, log, label = 'process guard'
 			(lock !== undefined && line.includes(KEEPER_SCRIPT) && carries('--lock')) ||
 			(argv ? identifyPid(pid, argv) === 'match' : runsScript(running, script ?? '\x00', '--self-lock', lock));
 		if (ours) continue;
-		try {
-			unlinkSync(file);
-			log.warn(
-				`${label}: removed ${file}, the host's own pid file for ${name}: it named pid ${pid}, which ` +
-					`is running \`${running.join(' ')}\`, and the host would have handed that pid back as the ${name} ` +
-					`instead of starting one.`
-			);
-		} catch (error) {
-			log.error(
-				`${label}: could not remove ${file}, which names pid ${pid} running something else: ` +
-					`${error instanceof Error ? error.message : String(error)}. The host will hand that pid back as the ${name} rather than start one.`
-			);
-		}
+		removeHostPidFile(file, name, pid, `which is running \`${running.join(' ')}\``, log, label);
+	}
+}
+
+/**
+ * @param {string} file @param {string} name @param {number} pid @param {string} what What the pid is, after "which".
+ * @param {import('./host.js').Log} log @param {string} label
+ */
+function removeHostPidFile(file, name, pid, what, log, label) {
+	try {
+		unlinkSync(file);
+		log.warn(
+			`${label}: removed ${file}, the host's own pid file for ${name}: it named pid ${pid}, ${what}, and the ` +
+				`host would have handed that pid back as the ${name} instead of starting one.`
+		);
+	} catch (error) {
+		log.error(
+			`${label}: could not remove ${file}, which names pid ${pid}, ${what}: ` +
+				`${error instanceof Error ? error.message : String(error)}. The host will hand that pid back as the ${name} rather than start one.`
+		);
 	}
 }
 

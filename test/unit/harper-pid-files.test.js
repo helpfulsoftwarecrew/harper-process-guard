@@ -11,9 +11,11 @@ import { argvOf, isAlive } from '../../src/identity.js';
 import { clearStaleHostPidFiles, REAPER_WATCH_MS, supervisorFor } from '../../src/index.js';
 import { lockPath, readLock } from '../../src/lock.js';
 import { runsScript } from '../../src/node.js';
-import { KEEPER_SCRIPT, pidOf, waitFor, withSpawn } from '../support/harness.js';
+import { KEEPER_SCRIPT, pidOf, skipOnWindows, waitFor, withSpawn, withZombie } from '../support/harness.js';
 import { withTempDir } from '../support/sandbox.js';
 import { captureLogs } from '../support/sandbox.js';
+
+const NO_ZOMBIE = 'Windows leaves no zombie for a pid file to name.';
 
 const pidFile = (/** @type {string} */ root, /** @type {string} */ name) => path.join(root, 'pids', `${name}.pid`);
 const write = (/** @type {string} */ root, /** @type {string} */ name, /** @type {number} */ pid) => {
@@ -166,35 +168,45 @@ test("NEGATIVE: a reaper whose Harper pid file names another name's keeper is st
 		})
 	));
 
+/**
+ * The bundled supervisor started through Harper's spawn with its reaper up, and the watchdog's tick in hand rather
+ * than on its 60 s timer. `lines` gathers what the watchdog warns and errors.
+ *
+ * @param {string} root @param {any} spawn @param {string} name The reaper's lock name.
+ */
+async function reaperUnderWatchdog(root, spawn, name) {
+	const pidDir = path.join(root, 'locks');
+	fs.mkdirSync(pidDir, { recursive: true });
+	/** @type {string[]} */
+	const lines = [];
+	const keep = (/** @type {string} */ line) => void lines.push(line);
+	const log = { info: () => {}, warn: keep, error: keep };
+	const supervisor = supervisorFor({}, { log, spawn: harperSpawn(root, spawn), reaperName: name });
+	/** @type {(() => void)[]} */
+	const ticks = [];
+	const realSetInterval = globalThis.setInterval;
+	globalThis.setInterval = /** @type {any} */ (
+		(/** @type {() => void} */ fn, /** @type {number} */ ms) => {
+			if (ms !== REAPER_WATCH_MS) return realSetInterval(fn, ms);
+			ticks.push(fn);
+			return { unref() {} };
+		}
+	);
+	const result = await supervisor.start([], { root, pidDir, fingerprintParts: ['relaunch'] }).finally(() => {
+		globalThis.setInterval = realSetInterval;
+	});
+	const first = /** @type {any} */ (result.reaper);
+	assert.equal(first?.started, true, `the reaper did not start: ${first?.error}`);
+	const tick = ticks[0];
+	assert.ok(tick && ticks.length === 1, `the bundled supervisor set ${ticks.length} watchdogs, not one`);
+	return { pidDir, lines, first, tick };
+}
+
 test("NEGATIVE: the watchdog's relaunch clears a dead reaper's Harper pid file that another name's keeper now holds", () =>
 	withTempDir('dd-hpid-', (root) =>
 		withSpawn(async ({ spawn }) => {
 			const name = 'datadog-agent-reaper';
-			const pidDir = path.join(root, 'locks');
-			fs.mkdirSync(pidDir, { recursive: true });
-			/** @type {string[]} */
-			const lines = [];
-			const keep = (/** @type {string} */ line) => void lines.push(line);
-			const log = { info: () => {}, warn: keep, error: keep };
-			const supervisor = supervisorFor({}, { log, spawn: harperSpawn(root, spawn), reaperName: name });
-			// The watchdog's timer is taken rather than waited on: the bundled supervisor fixes it at 60 s.
-			/** @type {(() => void)[]} */
-			const ticks = [];
-			const realSetInterval = globalThis.setInterval;
-			globalThis.setInterval = /** @type {any} */ (
-				(/** @type {() => void} */ fn, /** @type {number} */ ms) => {
-					if (ms !== REAPER_WATCH_MS) return realSetInterval(fn, ms);
-					ticks.push(fn);
-					return { unref() {} };
-				}
-			);
-			const result = await supervisor.start([], { root, pidDir, fingerprintParts: ['relaunch'] }).finally(() => {
-				globalThis.setInterval = realSetInterval;
-			});
-			const first = /** @type {any} */ (result.reaper);
-			assert.equal(first?.started, true, `the reaper did not start: ${first?.error}`);
-			const tick = ticks[0];
-			assert.ok(tick && ticks.length === 1, `the bundled supervisor set ${ticks.length} watchdogs, not one`);
+			const { pidDir, lines, first, tick } = await reaperUnderWatchdog(root, spawn, name);
 
 			// The reaper dies, and a keeper of another name takes the pid Harper's file still names.
 			process.kill(first.pid, 'SIGKILL');
@@ -214,6 +226,64 @@ test("NEGATIVE: the watchdog's relaunch clears a dead reaper's Harper pid file t
 			assert.equal(Number(fs.readFileSync(pidFile(root, name), 'utf-8')), relaunched);
 		})
 	));
+
+// A reaper killed after the worker thread that spawned it had ended: no thread is left to reap it, and Harper's
+// kill(pid, 0) reads the zombie as running, so every relaunch was handed the zombie back (pack hour, 2026-09-30).
+test("NEGATIVE: the watchdog's relaunch starts a reaper when Harper's pid file names the dead reaper as a zombie", (t) => {
+	if (skipOnWindows(t, NO_ZOMBIE)) return;
+	return withTempDir('dd-hpid-', (root) =>
+		withSpawn(async ({ spawn }) =>
+			withZombie(async (zombie) => {
+				const name = 'datadog-agent-reaper';
+				const { pidDir, lines, first, tick } = await reaperUnderWatchdog(root, spawn, name);
+				process.kill(first.pid, 'SIGKILL');
+				await waitFor(() => !isAlive(first.pid), 'the reaper to die');
+				// Its lock and Harper's file name it still, and it has not been reaped.
+				const lock = lockPath(pidDir, name);
+				fs.writeFileSync(lock, fs.readFileSync(lock, 'utf-8').replace(/^\d+/, String(zombie)));
+				write(root, name, zombie);
+
+				tick();
+				await waitFor(
+					() => lines.some((line) => /relaunch/.test(line)),
+					'the watchdog to relaunch the reaper or say why not'
+				);
+				assert.match(lines.join('\n'), /has been relaunched as pid/, lines.join('\n'));
+				const relaunched = readLock(lock)?.pid ?? 0;
+				assert.notEqual(relaunched, zombie, 'the zombie Harper handed back was taken for the reaper');
+				assert.ok(argvOf(relaunched)?.join(' ').includes('reaper.js'), 'the relaunched pid is not running reaper.js');
+			})
+		)
+	);
+});
+
+test("NEGATIVE: a Harper pid file naming a zombie is removed, since Harper's check reads a zombie as running", (t) => {
+	if (skipOnWindows(t, NO_ZOMBIE)) return;
+	return withTempDir('dd-hpid-', (root) =>
+		withZombie(async (zombie) => {
+			write(root, 'datadog-agent-reaper', zombie);
+			write(root, 'datadog-trace-agent', zombie);
+			const lines = await captureLogs(() =>
+				clearStaleHostPidFiles(
+					root,
+					[
+						{
+							name: 'datadog-agent-reaper',
+							script: '/reaper.js',
+							lock: path.join(root, 'locks', 'datadog-agent-reaper.pid'),
+						},
+						{ name: 'datadog-trace-agent', argv: ['/opt/dd/bin/trace-agent', 'run'] },
+					],
+					console
+				)
+			);
+			assert.equal(fs.existsSync(pidFile(root, 'datadog-agent-reaper')), false, "the reaper's file survived");
+			assert.equal(fs.existsSync(pidFile(root, 'datadog-trace-agent')), false, "the trace agent's file survived");
+			const said = lines.filter((line) => line.includes(`named pid ${zombie}, which has exited and was never reaped`));
+			assert.equal(said.length, 2, lines.join('\n'));
+		})
+	);
+});
 
 test('a reaper file naming a live pid that is not running reaper.js is removed', () =>
 	withTempDir('dd-hpid-', async (root) => {

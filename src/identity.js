@@ -225,6 +225,20 @@ export function isAlive(pid) {
 	return pid === process.pid || inspect(pid, false).alive;
 }
 
+/**
+ * Whether `pid` has exited and not been reaped. kill(2) still reaches it, which is all a host's pid-file check asks,
+ * and only its parent can clear it: a thread that spawned it and has since ended never will. @param {number} pid
+ */
+export function isZombie(pid) {
+	if (!Number.isInteger(pid) || pid <= 0 || pid === process.pid) return false;
+	try {
+		process.kill(pid, 0);
+	} catch (error) {
+		if (errnoCode(error) !== 'EPERM') return false;
+	}
+	return !inspect(pid, false).alive;
+}
+
 /** Cadence for a wait measured in seconds. Each pass costs a `ps` on darwin, so tighter forks hundreds of
  * times and buys nothing. */
 export const STOP_POLL_MS = 50;
