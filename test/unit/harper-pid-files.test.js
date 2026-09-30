@@ -11,7 +11,7 @@ import { argvOf, isAlive } from '../../src/identity.js';
 import { clearStaleHostPidFiles, REAPER_WATCH_MS, supervisorFor } from '../../src/index.js';
 import { lockPath, readLock } from '../../src/lock.js';
 import { runsScript } from '../../src/node.js';
-import { KEEPER_SCRIPT, pidOf, skipOnWindows, waitFor, withSpawn, withZombie } from '../support/harness.js';
+import { KEEPER_SCRIPT, WINDOWS, pidOf, skipOnWindows, waitFor, withSpawn, withZombie } from '../support/harness.js';
 import { withTempDir } from '../support/sandbox.js';
 import { captureLogs } from '../support/sandbox.js';
 
@@ -25,8 +25,9 @@ const write = (/** @type {string} */ root, /** @type {string} */ name, /** @type
 const silent = { info: () => {}, warn: () => {}, error: () => {} };
 
 /**
- * Harper's constrained spawn as security/jsLoader.ts has it at v5.2.9: a bare `node` only, and a live pid in
- * `<root>/pids/<name>.pid` handed back in place of a spawn. @param {string} root @param {any} spawn
+ * Harper's constrained spawn as security/jsLoader.ts has it at v5.2.9: a bare `node` only, a live pid in
+ * `<root>/pids/<name>.pid` handed back in place of a spawn, and the file removed on its own child's exit.
+ * @param {string} root @param {any} spawn
  */
 const harperSpawn =
 	(root, spawn) => (/** @type {string} */ command, /** @type {string[]} */ args, /** @type {any} */ options) => {
@@ -40,8 +41,27 @@ const harperSpawn =
 		// A bare `node` from PATH runs as `node`, which is the command line the lock records and identifies by.
 		const child = spawn(process.execPath, args, { ...options, argv0: 'node' });
 		write(root, options.name, child.pid);
+		child.on('exit', () => fs.rmSync(file, { force: true }));
 		return child;
 	};
+
+/** What Harper's pid file for `name` names, or 0 when there is none. @param {string} root @param {string} name */
+const named = (root, name) => {
+	try {
+		return Number(fs.readFileSync(pidFile(root, name), 'utf-8'));
+	} catch {
+		return 0;
+	}
+};
+
+/**
+ * That Harper spawned the reaper rather than handing a pid back: its file names the reaper on win32, and elsewhere
+ * named the reaper's launcher, whose exit removed it. @param {string} root @param {string} name @param {number} reaper
+ */
+async function spawnedByHarper(root, name, reaper) {
+	if (WINDOWS) assert.equal(named(root, name), reaper);
+	else await waitFor(() => named(root, name) === 0, "Harper's file to go with the launcher it named");
+}
 
 test('NEGATIVE: a Harper pid file naming a live pid that is not the agent is removed, and the log says what it was running', () =>
 	withTempDir('dd-hpid-', async (root) => {
@@ -161,7 +181,7 @@ test("NEGATIVE: a reaper whose Harper pid file names another name's keeper is st
 				assert.equal(reaper?.started, true, `the reaper did not start: ${reaper?.error}`);
 				assert.notEqual(reaper.pid, pidOf(standIn), "the keeper's pid was taken for the reaper");
 				assert.ok(argvOf(reaper.pid)?.join(' ').includes('reaper.js'), 'the reaper pid is not running reaper.js');
-				assert.equal(Number(fs.readFileSync(pidFile(root, 'datadog-agent-reaper'), 'utf-8')), reaper.pid);
+				await spawnedByHarper(root, 'datadog-agent-reaper', reaper.pid);
 			} finally {
 				for (const child of children) if (child.pid) child.kill('SIGKILL');
 			}
@@ -223,7 +243,7 @@ test("NEGATIVE: the watchdog's relaunch clears a dead reaper's Harper pid file t
 			const relaunched = readLock(lockPath(pidDir, name))?.pid ?? 0;
 			assert.notEqual(relaunched, pidOf(standIn), "the keeper's pid was taken for the reaper");
 			assert.ok(argvOf(relaunched)?.join(' ').includes('reaper.js'), 'the relaunched pid is not running reaper.js');
-			assert.equal(Number(fs.readFileSync(pidFile(root, name), 'utf-8')), relaunched);
+			await spawnedByHarper(root, name, relaunched);
 		})
 	));
 

@@ -393,7 +393,7 @@ export async function claimLock({ pidDir, name, version, argv, timeoutMs = CLAIM
  * pid onto the winner's file.
  *
  * @param {string} path @param {string} token @param {number} pid @param {number} version @param {readonly string[]} argv
- * @param {Owner} [owner] A keeper's commit, which names the host that launched it rather than the keeper.
+ * @param {Owner | { host: number }} [owner] A keeper's or launcher's commit, which names the host that launched it.
  * @returns {Promise<WriteOutcome>}
  */
 export function commitLock(path, token, pid, version, argv, owner = undefined) {

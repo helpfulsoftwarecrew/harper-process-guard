@@ -1,6 +1,7 @@
 // @ts-check
 // The reaper signals things, so the cases that matter are the ones where it must not.
 import assert from 'node:assert/strict';
+import { once } from 'node:events';
 import fs from 'node:fs';
 import path from 'node:path';
 import test from 'node:test';
@@ -12,6 +13,7 @@ import { claimLock, lockPath, readLock } from '../../src/lock.js';
 import { collectTargets, parseArgs, reapTarget, replacementPid, run } from '../../src/reaper.js';
 import {
 	anotherStart,
+	countRunning,
 	deadPid,
 	fixture,
 	pidOf,
@@ -357,6 +359,31 @@ test('NEGATIVE: a reaper told to stop leaves its lock to the newer reaper that t
 			reaper.kill('SIGTERM');
 			await exited;
 			assert.equal(readLock(self)?.pid, newer.pid, "a reaper told to stop removed the newer reaper's lock");
+		})
+	);
+});
+
+test('NEGATIVE: a launcher whose claim changed hands before its commit stops the reaper it started', (t) => {
+	if (skipOnWindows(t, 'no launcher runs on win32, where the reaper is spawned directly and leaves no zombie.')) return;
+	return withTempDir('guard-reap-', (dir) =>
+		withSpawn(async ({ spawn }) => {
+			const self = lockPath(dir, 'self');
+			// Another claim holds the lock, as after a takeover while this launcher was starting.
+			seedLock(self, { pid: 0, token: 'the-other-claim', host: process.pid });
+			const flags = ['--host-pid', String(process.pid), '--pid-dir', dir, '--self-lock', self];
+			const args = [REAPER_SCRIPT, '--launch', '--token', 'this-claim', '--version', '1', ...flags];
+			const launcher = spawn(process.execPath, args, { stdio: ['ignore', 'ignore', 'pipe'] });
+			let said = '';
+			launcher.stderr?.on('data', (chunk) => (said += chunk));
+			const [code] = await once(launcher, 'exit');
+
+			assert.equal(code, 3, said);
+			assert.match(said, /found its lock taken; stopped it/);
+			assert.equal(readLock(self)?.token, 'the-other-claim', "the launcher wrote over another claim's lock");
+			await waitFor(
+				() => countRunning([process.execPath, REAPER_SCRIPT, ...flags]) === 0,
+				'the unlocked reaper to be gone'
+			);
 		})
 	);
 });

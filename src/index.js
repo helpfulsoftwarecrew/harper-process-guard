@@ -2,12 +2,24 @@
 // One call for the lifecycle of the long-lived processes a host owns: take the lock, start or join,
 // keep watching, and leave behind something that stops them when the host goes.
 import { createHash } from 'node:crypto';
+import { setTimeout as delay } from 'node:timers/promises';
 import { fileURLToPath } from 'node:url';
 
 import { describeSpawnFailure, errorMessage } from './exit.js';
 import { clearStaleHostPidFiles, keepReaperAlive } from './node.js';
-import { CLAIM_TIMEOUT_MS, claimLock, commitLock, lockPath, readLock, releaseLock, safeLockWrite } from './lock.js';
-import { DEFAULT_TUNING, describeHandedBackPid, startFailure, superviseProcess } from './supervise.js';
+import {
+	CLAIM_TIMEOUT_MS,
+	START_FAILURE_MS,
+	claimLock,
+	commitLock,
+	lockPath,
+	readLock,
+	releaseLock,
+	releaseUnstarted,
+	safeLockWrite,
+} from './lock.js';
+import { LAUNCH_FLAG } from './reaper.js';
+import { DEFAULT_TUNING, describeHandedBackPid, keeperStartMs, startFailure, superviseProcess } from './supervise.js';
 
 /** @typedef {import('./host.js').Log} Log */
 /** @typedef {import('./supervise.js').ProcessState} ProcessState */
@@ -59,6 +71,8 @@ const SILENT = { info: () => {}, warn: () => {}, error: () => {} };
 
 const DEFAULT_REAPER_NAME = 'process-guard-reaper';
 const REAPER_SCRIPT = fileURLToPath(new URL('./reaper.js', import.meta.url));
+/** How often a thread looks for the pid a reaper's launcher commits. */
+const LAUNCH_POLL_MS = 10;
 
 export { argvOf, identify } from './identity.js';
 export { describeExit, describeSpawnFailure } from './exit.js';
@@ -148,13 +162,20 @@ async function launchReaper(ctx, config) {
 		return state;
 	}
 
+	// Through a launcher that exits at once, so init adopts the reaper: one the host spawned itself is reaped only by the
+	// thread that spawned it, and dies a zombie once the host has replaced that thread. Windows leaves no zombie.
+	const launching = process.platform !== 'win32';
+	const spawned = launching
+		? [REAPER_SCRIPT, LAUNCH_FLAG, '--token', claim.token, '--version', String(ctx.version), ...args.slice(1)]
+		: args;
 	// process.execPath first because PATH cannot shadow it; a bare `node` is what a host allowlist
 	// tends to carry, and a host that matches an allowlist on the command string refuses anything else.
 	/** @type {string[]} */
 	const refusals = [];
+	let launched = false;
 	for (const command of [process.execPath, 'node']) {
 		try {
-			const child = ctx.spawn(command, args, {
+			const child = ctx.spawn(command, spawned, {
 				// Its own process group: a signal to the host's group (GNU `timeout` sends one) would
 				// otherwise take down the very thing that has to outlive it.
 				detached: true,
@@ -175,10 +196,26 @@ async function launchReaper(ctx, config) {
 			}
 			// The same refusal a guarded process gets: a host that reuses processes by name can answer with a
 			// pid that is not a reaper, and a reaper that is not one stops nothing when the host goes.
-			const handedBack = describeHandedBackPid(child, { argv: [command, ...args], binaryPath: REAPER_SCRIPT });
+			const handedBack = describeHandedBackPid(child, { argv: [command, ...spawned], binaryPath: REAPER_SCRIPT });
 			if (handedBack) {
 				refusals.push(`${command}: ${handedBack}`);
 				continue;
+			}
+			if (launching) {
+				// A launcher that ran and failed would fail the same way under the other command, so none is tried.
+				const reaper = await awaitLaunch(lockPath(ctx.pidDir, name), claim.token, child);
+				if ('error' in reaper) {
+					refusals.push(`${command}: ${reaper.error}`);
+					launched = true;
+					break;
+				}
+				state.started = true;
+				state.pid = reaper.pid;
+				state.command = command;
+				ctx.log.info(
+					`process guard: ${name} started (pid ${reaper.pid}), watching what is locked under ${ctx.pidDir}.`
+				);
+				return state;
 			}
 			state.started = true;
 			state.pid = child.pid;
@@ -198,7 +235,8 @@ async function launchReaper(ctx, config) {
 		}
 	}
 
-	const releaseError = await safeLockWrite(releaseLock(lockPath(ctx.pidDir, name), claim.token));
+	// A launcher that ran has settled the claim already, giving it back or finding it taken.
+	const releaseError = launched ? undefined : await safeLockWrite(releaseLock(lockPath(ctx.pidDir, name), claim.token));
 	state.error = refusals.join('; ');
 	if (releaseError) state.error += `; releasing its lock also failed: ${releaseError}`;
 	const line =
@@ -207,6 +245,59 @@ async function launchReaper(ctx, config) {
 	ctx.log.warn(`process guard: ${line}`);
 	ctx.report.push(line);
 	return state;
+}
+
+/**
+ * Wait for a reaper's launcher to commit the reaper's pid under this claim, and reap the launcher before returning, so a
+ * thread ended right after leaves no zombie launcher. A failed launch gives the claim back unless the pid came meanwhile.
+ *
+ * @param {string} path @param {string} token @param {import('./supervise.js').SpawnedChild} launcher
+ * @returns {Promise<{ pid: number } | { error: string }>}
+ */
+async function awaitLaunch(path, token, launcher) {
+	/** @type {string | null} */
+	let ended = null;
+	const exited = new Promise((resolve) => {
+		if (typeof launcher.once !== 'function') return resolve(undefined);
+		launcher.once('exit', (code, signal) => {
+			ended = signal ? `signal ${signal}` : `exit code ${code}`;
+			resolve(undefined);
+		});
+	});
+	const reapLauncher = async () => {
+		const grace = new AbortController();
+		await Promise.race([exited, delay(START_FAILURE_MS, undefined, { signal: grace.signal }).catch(() => {})]);
+		grace.abort();
+	};
+	// Held timers throughout: a host awaiting guard() may have nothing else on its event loop.
+	const deadline = Date.now() + keeperStartMs();
+	for (;;) {
+		const held = readLock(path);
+		if (held?.token !== token) return { error: 'its claim was taken over before its launcher named a pid' };
+		if (held.pid > 0) {
+			await reapLauncher();
+			return { pid: held.pid };
+		}
+		const gaveUp =
+			ended !== null && ended !== 'exit code 0'
+				? `its launcher ended with ${ended}`
+				: Date.now() >= deadline
+					? `its launcher named no pid within ${keeperStartMs()}ms`
+					: null;
+		if (gaveUp !== null) {
+			/** @type {Awaited<ReturnType<typeof releaseUnstarted>>} */
+			let given;
+			try {
+				given = await releaseUnstarted(path, token);
+			} catch (error) {
+				return { error: `${gaveUp}, and giving back its claim failed: ${errorMessage(error)}` };
+			}
+			if (typeof given !== 'object') return { error: gaveUp };
+			await reapLauncher();
+			return { pid: given.pid };
+		}
+		await delay(LAUNCH_POLL_MS);
+	}
 }
 
 /**

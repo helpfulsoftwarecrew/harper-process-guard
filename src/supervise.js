@@ -100,8 +100,8 @@ const KEEPER_COMMANDS = [process.execPath, 'node'];
 const KEEPER_WATCH_MS = 10;
 /** How often a thread waiting for a keeper's record checks the keeper is still there to write one. */
 const KEEPER_ALIVE_MS = 250;
-/** Two node starts and a start-time read, then the keeper's own commit waiting out the gate. */
-const keeperStartMs = () => keeperBootMs() + gateWaitMs() + aliveBudgetMs();
+/** Two node starts and a start-time read, then the keeper's own commit waiting out the gate. A reaper's launcher needs less. */
+export const keeperStartMs = () => keeperBootMs() + gateWaitMs() + aliveBudgetMs();
 
 /** The descriptors a caller's stdio pipes to its thread; Node pipes any of the first three left unset.
  * @param {import('node:child_process').StdioOptions | undefined} stdio @returns {number[]} */

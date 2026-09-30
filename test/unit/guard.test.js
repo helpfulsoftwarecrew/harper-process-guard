@@ -298,6 +298,34 @@ test('a reaper whose first command fails after returning falls back to the secon
 		})
 	));
 
+test('NEGATIVE: a reaper launcher that fails gives its claim back and says why, and is not run again as bare node', (t) => {
+	if (skipOnWindows(t, 'no launcher runs on win32, where the reaper is spawned directly and leaves no zombie.')) return;
+	return withTempDir('guard-call-', (dir) =>
+		withSpawn(async ({ spawn, calls }) => {
+			// An empty token is refused by the launcher before it starts anything, as any launch it cannot commit is.
+			const result = await guard({
+				pidDir: dir,
+				spawn: (command, args, options) =>
+					spawn(
+						command,
+						args.map((arg, index) => (args[index - 1] === '--token' ? '' : arg)),
+						options
+					),
+				reaper: { name: 'reaper', graceMs: 100 },
+				processes: [],
+			});
+			try {
+				assert.equal(result.reaper?.started, false, `a failed launch read as a reaper: pid ${result.reaper?.pid}`);
+				assert.match(result.reaper?.error ?? '', /its launcher ended with exit code 2/);
+				assert.equal(calls.length, 1, 'a launcher that ran and failed was run again under the other command');
+				assert.equal(fs.existsSync(lockPath(dir, 'reaper')), false, 'the failed launch left its claim behind');
+			} finally {
+				result.stop();
+			}
+		})
+	);
+});
+
 test('a claimLock failure while launching the reaper does not take the already-started processes down with it', () =>
 	withTempDir('guard-call-', (dir) =>
 		withSpawn(async ({ spawn }) => {

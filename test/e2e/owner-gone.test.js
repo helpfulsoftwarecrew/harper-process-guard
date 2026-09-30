@@ -168,6 +168,40 @@ test('deaths after the thread that started the process is gone leave no zombie o
 	);
 });
 
+// The pack hour of 2026-09-30: the reaper was killed after Harper had replaced every worker, and stayed a zombie of it.
+test('a reaper killed after the thread that launched it is gone leaves no zombie on the host', (t) => {
+	if (skipOnWindows(t, NO_ZOMBIE)) return;
+	return withTempDir('guard-gone-', async (dir) => {
+		const before = new Set(zombiesOfThisHost());
+		const worker = new Worker(path.join(import.meta.dirname, '..', 'support', 'reaper-owner-worker.js'), {
+			workerData: { pidDir: dir, name: 'reaper' },
+		});
+		/** @type {number | undefined} */
+		let pid;
+		try {
+			/** @type {{ pid?: number, started?: boolean, error?: string }} */
+			const launched = await new Promise((resolve, reject) => {
+				worker.once('message', resolve);
+				worker.once('error', reject);
+			});
+			pid = launched.pid;
+			assert.equal(launched.started, true, `the worker launched no reaper: ${launched.error}`);
+			await worker.terminate();
+			const parent = processTable().find((row) => row.pid === pid)?.ppid;
+
+			process.kill(/** @type {number} */ (pid), 'SIGKILL');
+			await waitFor(() => !isAlive(/** @type {number} */ (pid)), 'the reaper to die');
+			await settle(200);
+			const left = zombiesOfThisHost().filter((zombie) => !before.has(zombie));
+			assert.deepEqual(left, [], 'the reaper died a zombie that nothing on this host will ever reap');
+			assert.notEqual(parent, process.pid, 'the reaper was a child of the host, which only its spawning thread reaps');
+		} finally {
+			await worker.terminate();
+			if (pid !== undefined && isAlive(pid)) process.kill(pid, 'SIGKILL');
+		}
+	});
+});
+
 test('a process whose output its thread reads through a pipe outlives that thread, and goes on writing', (t) => {
 	if (skipOnWindows(t, NO_RELAY)) return;
 	return withTempDir('guard-gone-', (dir) =>

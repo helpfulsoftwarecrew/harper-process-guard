@@ -1,17 +1,21 @@
 // @ts-check
 // A detached process, because nothing inside the host survives its death: there is no worker shutdown
 // hook, and SIGKILL fires no handler. Spawned by path, never imported.
+import { spawn } from 'node:child_process';
 import { closeSync, openSync, readdirSync, writeSync } from 'node:fs';
 import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
-import { pathToFileURL } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
 import { identifyKept, isAlive, STOP_POLL_MS, waitWhileAlive } from './identity.js';
 import { errorMessage } from './exit.js';
-import { readLock, releaseOwnLock, removeLock } from './lock.js';
+import { commitLock, readLock, releaseOwnLock, removeLock } from './lock.js';
 
 const DEFAULT_WATCH_POLL_MS = 1000;
 const DEFAULT_TERM_GRACE_MS = 5000;
+
+/** First argument of a launcher: start the reaper, commit its pid under `--token`, and exit. */
+export const LAUNCH_FLAG = '--launch';
 
 /**
  * @typedef {object} ReaperOptions
@@ -222,15 +226,63 @@ function stopOnSignal(options, signal) {
 	process.exit(0);
 }
 
-// Executed directly, which is how a host uses this. Guarded so the exports above stay importable by a
-// test without a reaper loop starting as a side effect.
-if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
-	const options = parseArgs(process.argv.slice(2));
-	if (!Number.isInteger(options.hostPid) || options.hostPid <= 0 || !options.pidDir) {
-		// A reaper with nothing to watch would sit forever, and a non-positive pid selects a process GROUP.
-		process.stderr.write('reaper: --host-pid must be a positive integer and --pid-dir must be given\n');
+/**
+ * Start the reaper, commit its pid on its own lock under the claim's token, and exit, so the thread that spawned this
+ * reaps it at once and init adopts the reaper. A reaper the host spawned itself dies a zombie once that thread is gone.
+ *
+ * @param {string[]} argv `--token <token> --version <version>`, then the reaper's own flags.
+ */
+async function launch(argv) {
+	const [tokenFlag, token = '', versionFlag, version = '', ...flags] = argv;
+	const options = parseArgs(flags);
+	if (tokenFlag !== '--token' || versionFlag !== '--version' || !token || !options.selfLock) {
+		process.stderr.write('reaper launcher: --token and --version come first, and --self-lock must be given\n');
 		process.exit(2);
 	}
+	// Refused here as the reaper would refuse them, before a pid that exits at once is committed as the reaper.
+	refuseNothingToWatch(options);
+	// The script as the thread spelled it, which its claim records: import.meta.url has symlinks resolved, and a lock
+	// naming another path reads the running reaper as an orphan, so the next claim starts a second.
+	const reaperArgv = [process.execPath, process.argv[1] ?? fileURLToPath(import.meta.url), ...flags];
+	// Inherited, so whatever stdio the host gave this launcher is the reaper's.
+	const reaper = spawn(process.execPath, reaperArgv.slice(1), { stdio: 'inherit' });
+	if (!reaper.pid) {
+		reaper.once('error', (error) => {
+			process.stderr.write(`reaper launcher: the reaper could not be started: ${error.message}\n`);
+			process.exit(1);
+		});
+		return;
+	}
+	/** @type {string} */
+	let outcome;
+	try {
+		const host = { host: options.hostPid };
+		outcome = await commitLock(options.selfLock, token, reaper.pid, Number.parseInt(version, 10), reaperArgv, host);
+	} catch (error) {
+		outcome = errorMessage(error);
+	}
+	if (outcome === 'written') process.exit(0);
+	// The claim is not this launcher's any more, and a reaper under no lock would run beside the one that holds it.
+	reaper.kill('SIGKILL');
+	process.stderr.write(`reaper launcher: committing the reaper's pid found its lock ${outcome}; stopped it\n`);
+	process.exit(3);
+}
+
+/** @param {ReaperOptions} options */
+function refuseNothingToWatch(options) {
+	if (Number.isInteger(options.hostPid) && options.hostPid > 0 && options.pidDir) return;
+	// A reaper with nothing to watch would sit forever, and a non-positive pid selects a process GROUP.
+	process.stderr.write('reaper: --host-pid must be a positive integer and --pid-dir must be given\n');
+	process.exit(2);
+}
+
+// Executed directly, which is how a host uses this. Guarded so the exports above stay importable by a
+// test without a reaper loop starting as a side effect.
+const executed = process.argv[1] !== undefined && import.meta.url === pathToFileURL(process.argv[1]).href;
+if (executed && process.argv[2] === LAUNCH_FLAG) void launch(process.argv.slice(3));
+else if (executed) {
+	const options = parseArgs(process.argv.slice(2));
+	refuseNothingToWatch(options);
 	// Registered before run() starts waiting: a signal that lands during the wait is the case this exists for.
 	process.on('SIGTERM', () => stopOnSignal(options, 'SIGTERM'));
 	process.on('SIGINT', () => stopOnSignal(options, 'SIGINT'));
