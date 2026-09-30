@@ -8,7 +8,7 @@ import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 
 import { argvOf, isAlive } from '../../src/identity.js';
-import { lockPath, readLock } from '../../src/lock.js';
+import { claimLock, lockPath, readLock } from '../../src/lock.js';
 import { collectTargets, parseArgs, reapTarget, replacementPid, run } from '../../src/reaper.js';
 import {
 	deadPid,
@@ -17,6 +17,7 @@ import {
 	readyLine,
 	seedLock,
 	skipOnWindows,
+	slow,
 	waitFor,
 	withSpawn,
 	withTempDir,
@@ -197,6 +198,86 @@ test('NEGATIVE: a reaper leaves its lock to the newer reaper that took it, wheth
 		})
 	));
 
+/**
+ * A reaper spawned by path, watching this process, once its first log line proves its signal handlers exist.
+ * @param {import('../../src/supervise.js').Spawn} spawn @param {string} pidDir @param {string} log
+ */
+async function startReaper(spawn, pidDir, log) {
+	const self = lockPath(pidDir, 'self');
+	const args = [
+		REAPER_SCRIPT,
+		'--host-pid',
+		String(process.pid),
+		'--pid-dir',
+		pidDir,
+		'--self-lock',
+		self,
+		'--log',
+		log,
+	];
+	const reaper = spawn(process.execPath, args, { stdio: 'ignore' });
+	/** @type {Promise<unknown>} */
+	const exited = new Promise((resolve) => reaper.once('exit', resolve));
+	const logged = () => (fs.existsSync(log) ? fs.readFileSync(log, 'utf-8') : '');
+	await waitFor(() => logged().includes('watching pid'), 'the reaper to start');
+	seedLock(self, { pid: pidOf(reaper), argv: [process.execPath, ...args] });
+	return { reaper, exited, self, logged };
+}
+
+const NO_SIGTERM = 'a Windows process cannot be sent SIGTERM, so the reaper runs no handler there to test.';
+
+test('a reaper told to stop exits and writes nothing more when its pid directory has already gone', (t) => {
+	if (skipOnWindows(t, NO_SIGTERM)) return;
+	return withTempDir('guard-reap-', (dir) =>
+		withSpawn(async ({ spawn }) => {
+			// A host tearing down removes the pid directory while the reaper it is stopping still runs.
+			const pidDir = path.join(dir, 'pids');
+			fs.mkdirSync(pidDir);
+			const { reaper, exited, logged } = await startReaper(spawn, pidDir, path.join(dir, 'reaper.log'));
+			fs.rmSync(pidDir, { recursive: true, force: true });
+			reaper.kill('SIGTERM');
+			await exited;
+			const lines = logged().trim().split('\n');
+			assert.equal(lines.length, 2, `a vanished lock was logged as more than a stop: ${lines.slice(1).join(' | ')}`);
+			assert.match(lines[1] ?? '', /received SIGTERM/);
+			assert.doesNotMatch(
+				lines[1] ?? '',
+				/could not release/,
+				'a lock whose directory had gone was logged as an error'
+			);
+		})
+	);
+});
+
+test('a reaper told to stop exits at once rather than wait on a gate another process holds', (t) => {
+	if (skipOnWindows(t, NO_SIGTERM)) return;
+	return withTempDir('guard-reap-', (dir) =>
+		withSpawn(async ({ spawn }) => {
+			const { reaper, exited, self } = await startReaper(spawn, dir, path.join(dir, 'reaper.log'));
+			// A live process holds the gate: this one, which never lets go of it.
+			fs.writeFileSync(`${self}.claiming`, String(process.pid));
+			const signalled = Date.now();
+			reaper.kill('SIGTERM');
+			await exited;
+			const took = Date.now() - signalled;
+			assert.ok(took < 1000, `the reaper outlived SIGTERM by ${took} ms waiting on a gate`);
+			// Left naming a pid that has gone, which the next claim reclaims once the gate is free.
+			assert.equal(readLock(self)?.pid, pidOf(reaper));
+			assert.equal(isAlive(pidOf(reaper)), false);
+			fs.unlinkSync(`${self}.claiming`);
+			const claim = await claimLock({
+				pidDir: dir,
+				name: 'self',
+				version: 1,
+				argv: ['/bin/reaper'],
+				timeoutMs: slow(5000),
+			});
+			assert.equal(claim.outcome, 'won');
+			assert.match(claim.outcome === 'won' ? claim.notes.join('\n') : '', /reclaimed the lock from pid/);
+		})
+	);
+});
+
 test('NEGATIVE: a reaper told to stop leaves its lock to the newer reaper that took it', (t) => {
 	if (skipOnWindows(t, 'a Windows process cannot be sent SIGTERM, so the reaper runs no handler there to test.'))
 		return;
@@ -228,10 +309,19 @@ test('NEGATIVE: a reaper told to stop leaves its lock to the newer reaper that t
 			reaper.kill('SIGTERM');
 			await exited;
 			assert.equal(readLock(self)?.pid, newer.pid, "a reaper told to stop removed the newer reaper's lock");
-			assert.match(fs.readFileSync(log, 'utf-8'), new RegExp(`its lock now names pid ${newer.pid}; left it`));
 		})
 	);
 });
+
+test('a reaper whose pid directory has gone by the time its host does logs no error about its lock', () =>
+	withTempDir('guard-reap-', async (dir) => {
+		// A host tearing down removed the directory; the lock went with it, which is the outcome the release wants.
+		const gone = path.join(dir, 'pids');
+		const log = path.join(dir, 'reaper.log');
+		await run(options(gone, { hostPid: await deadPid(), selfLock: lockPath(gone, 'self'), logFile: log }));
+		assert.doesNotMatch(fs.readFileSync(log, 'utf-8'), /could not release/);
+		assert.match(fs.readFileSync(log, 'utf-8'), /done\./);
+	}));
 
 test('a replacement host inside the grace window keeps the processes for it to adopt', () =>
 	withTempDir('guard-reap-', (dir) =>

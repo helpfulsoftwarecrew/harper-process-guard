@@ -418,6 +418,10 @@ export function releaseOwnLock(path, pid) {
 		if (held.pid !== pid) return { outcome: /** @type {WriteOutcome} */ ('taken'), pid: held.pid };
 		unlinkQuietly(path);
 		return { outcome: /** @type {WriteOutcome} */ ('written'), pid };
+	}).catch((error) => {
+		// A directory removed under the reaper took the lock with it, and the gate's temp file cannot be written there.
+		if (errnoCode(error) !== 'ENOENT') throw error;
+		return { outcome: /** @type {WriteOutcome} */ ('gone'), pid: 0 };
 	});
 }
 

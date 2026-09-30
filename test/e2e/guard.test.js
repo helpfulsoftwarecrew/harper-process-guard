@@ -98,15 +98,14 @@ test('a killed host does not leave its process behind', { timeout: slow(60_000) 
 );
 
 test(
-	'a real SIGTERM to the reaper itself removes its own lock, leaving the host and its process alone',
+	'a real SIGTERM to the reaper itself ends it and nothing else, and leaves its lock to the next claim',
 	{ timeout: slow(30_000) },
 	(t) => {
 		if (
 			skipOnWindows(
 				t,
 				'a Windows process cannot be sent SIGTERM: process.kill terminates the reaper before its handler runs, ' +
-					'so the handler at src/reaper.js:197 is inert there and the reaper leaves its own lock behind. ' +
-					'Neither the cleanup nor that leak is covered on Windows.'
+					'so the handler in src/reaper.js is inert there and the line it logs is not covered on Windows.'
 			)
 		)
 			return;
@@ -128,14 +127,13 @@ test(
 					);
 
 					process.kill(started.reaper.pid, 'SIGTERM');
-					await waitFor(
-						() => !fs.existsSync(lockPath(dir, 'reaper')),
-						'the reaper to remove its own lock after SIGTERM',
-						{
-							timeoutMs: slow(10_000),
-							intervalMs: 50,
-						}
-					);
+					await waitFor(() => !isAlive(started.reaper.pid), 'the reaper to exit after SIGTERM', {
+						timeoutMs: slow(10_000),
+						intervalMs: 50,
+					});
+					// Its lock names a pid that has gone, which the next claim reclaims; nothing was written to release it.
+					assert.equal(readLock(lockPath(dir, 'reaper'))?.pid, started.reaper.pid);
+					assert.match(fs.readFileSync(reaperLog, 'utf-8'), /received SIGTERM; exiting/);
 
 					// The reaper was told to stop, not the host: hostPid never went, so nothing here should reap.
 					assert.equal(isAlive(host.pid ?? -1), true, 'the host was affected by a signal sent only to its reaper');

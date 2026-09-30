@@ -193,14 +193,14 @@ export function parseArgs(argv) {
 }
 
 /**
- * An unhandled SIGTERM kills this process before its own code runs, so without this a caller that signals
- * the reaper directly leaves its lock behind forever.
+ * Handled so the stop is logged rather than silent. The lock is left naming this pid, which the next claim reclaims:
+ * whoever stops a reaper may be removing its directory, and a release through the gate wrote into it mid-removal.
  *
  * @param {ReaperOptions} options @param {NodeJS.Signals} signal
  */
 function stopOnSignal(options, signal) {
-	log(options, `received ${signal}; leaving its own lock for a replacement and exiting.`);
-	releaseSelf(options).finally(() => process.exit(0));
+	log(options, `received ${signal}; exiting, and leaving its lock to the next claim.`);
+	process.exit(0);
 }
 
 // Executed directly, which is how a host uses this. Guarded so the exports above stay importable by a
