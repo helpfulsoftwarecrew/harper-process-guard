@@ -197,15 +197,17 @@ export function currentReaper(reaper, pidDir, defaultName) {
 /**
  * Harper's spawn hands back the pid in <root>/pids/<name>.pid when it answers kill(pid, 0), and after a
  * restart a thread of Harper itself answers for one. A file naming the real process, or a dead one, stays.
+ * So does one naming a keeper or launcher that carries this name's `lock`; any other keeper is a stranger here.
  *
  * @param {string | null} root
- * @param {Array<{ name: string; argv?: readonly string[]; script?: string }>} named
+ * @param {Array<{ name: string; argv?: readonly string[]; script?: string; lock?: string }>} named `lock` is the
+ *   guard's lock for the name, which its keeper carries as `--lock` and a reaper as `--self-lock`.
  * @param {import('./host.js').Log} log
  * @param {string} [label] How the component names itself in these lines. Defaults to this package.
  */
 export function clearStaleHostPidFiles(root, named, log, label = 'process guard') {
 	if (!root) return;
-	for (const { name, argv, script } of named) {
+	for (const { name, argv, script, lock } of named) {
 		const file = join(root, 'pids', `${name}.pid`);
 		let pid;
 		try {
@@ -216,10 +218,16 @@ export function clearStaleHostPidFiles(root, named, log, label = 'process guard'
 		if (!Number.isInteger(pid) || pid <= 0) continue;
 		const running = argvOf(pid);
 		if (running === null) continue;
-		// A keeper's launcher runs under the process's name for the moment it takes to start the keeper.
+		const line = running.join(' ');
+		const carries = (/** @type {string} */ flag) =>
+			lock === undefined || line.includes(` ${flag} ${lock} `) || line.endsWith(` ${flag} ${lock}`);
+		// A launcher runs under the process's name for a moment, so only a keeper of this name's lock keeps the
+		// file: another name's keeper that took the reaper's old pid had Harper hand it back as the reaper.
 		const ours =
-			running.join(' ').includes(KEEPER_SCRIPT) ||
-			(argv ? identifyPid(pid, argv) === 'match' : running.some((argument) => argument.endsWith(script ?? ' ')));
+			(lock !== undefined && line.includes(KEEPER_SCRIPT) && carries('--lock')) ||
+			(argv
+				? identifyPid(pid, argv) === 'match'
+				: running.some((argument) => argument.endsWith(script ?? '\x00')) && carries('--self-lock'));
 		if (ours) continue;
 		try {
 			unlinkSync(file);

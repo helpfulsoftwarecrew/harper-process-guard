@@ -411,15 +411,17 @@ const bundledSupervisor = (
 	async start(descriptors, context) {
 		const { root, pidDir, reaperLog, replacementPidFile, fingerprintParts } = context;
 		beforeStart?.(context);
+		// The guard builds the reaper's own argv; its script and its lock are the stable things to match on.
+		const reaperPidFile = { name: reaperName, script: '/reaper.js', lock: lockPath(pidDir, reaperName) };
 		clearStaleHostPidFiles(
 			root,
 			[
 				...descriptors.map((descriptor) => ({
 					name: descriptor.name,
 					argv: [descriptor.command, ...descriptor.args],
+					lock: lockPath(pidDir, descriptor.name),
 				})),
-				// The guard builds the reaper's own argv; its script name is the one stable thing to match on.
-				{ name: reaperName, script: '/reaper.js' },
+				reaperPidFile,
 			],
 			log,
 			label
@@ -467,8 +469,10 @@ const bundledSupervisor = (
 				log,
 				label,
 				reaperName,
-				relaunch: () =>
-					guard({
+				// A reaper that died left Harper's file naming its pid, which anything can take before the relaunch.
+				relaunch: () => {
+					clearStaleHostPidFiles(root, [reaperPidFile], log, label);
+					return guard({
 						pidDir,
 						spawn,
 						log,
@@ -476,7 +480,8 @@ const bundledSupervisor = (
 						stopOrphans: false,
 						processes: [],
 						reaper: reaperConfig,
-					}),
+					});
+				},
 			});
 		}
 		return {

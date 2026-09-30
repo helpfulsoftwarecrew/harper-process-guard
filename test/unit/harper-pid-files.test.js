@@ -1,13 +1,14 @@
 // Harper's spawn hands back the pid in <root>/pids/<name>.pid whenever kill(pid, 0) answers, and after a
 // restart a thread of Harper itself can answer, so the file has to go before the guard asks for a spawn.
 
+import { EventEmitter } from 'node:events';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 
 import { argvOf } from '../../src/identity.js';
-import { clearStaleHostPidFiles } from '../../src/index.js';
+import { clearStaleHostPidFiles, supervisorFor } from '../../src/index.js';
 import { KEEPER_SCRIPT, pidOf, waitFor, withSpawn } from '../support/harness.js';
 import { withTempDir } from '../support/sandbox.js';
 import { captureLogs } from '../support/sandbox.js';
@@ -17,6 +18,25 @@ const write = (/** @type {string} */ root, /** @type {string} */ name, /** @type
 	fs.mkdirSync(path.join(root, 'pids'), { recursive: true });
 	fs.writeFileSync(pidFile(root, name), `${pid}\n`);
 };
+const silent = { info: () => {}, warn: () => {}, error: () => {} };
+
+/**
+ * Harper's constrained spawn as security/jsLoader.ts has it at v5.2.9: a bare `node` only, and a live pid in
+ * `<root>/pids/<name>.pid` handed back in place of a spawn. @param {string} root @param {any} spawn
+ */
+const harperSpawn =
+	(root, spawn) => (/** @type {string} */ command, /** @type {string[]} */ args, /** @type {any} */ options) => {
+		if (command !== 'node') throw new Error(`Command ${command} is not allowed`);
+		const file = pidFile(root, options.name);
+		try {
+			const pid = Number.parseInt(fs.readFileSync(file, 'utf-8'), 10);
+			process.kill(pid, 0);
+			return Object.assign(new EventEmitter(), { pid, unref: () => {} });
+		} catch {}
+		const child = spawn(process.execPath, args, options);
+		write(root, options.name, child.pid);
+		return child;
+	};
 
 test('NEGATIVE: a Harper pid file naming a live pid that is not the agent is removed, and the log says what it was running', () =>
 	withTempDir('dd-hpid-', async (root) => {
@@ -64,20 +84,82 @@ test("a Harper pid file naming the real process is Harper's to keep, and one nam
 		assert.deepEqual(lines, []);
 	}));
 
+/** A node process whose command line reads as the keeper or launcher for `lock`. @param {any} spawn @param {string} mode @param {string} lock */
+const keeperStandIn = async (spawn, mode, lock) => {
+	const standIn = spawn(
+		process.execPath,
+		['-e', 'setInterval(() => {}, 1 << 30)', KEEPER_SCRIPT, mode, '--lock', lock, '--token', 'stand-in'],
+		{ stdio: 'ignore' }
+	);
+	await waitFor(() => argvOf(pidOf(standIn)) !== null, 'the stand-in to appear in the process table');
+	return standIn;
+};
+
 test("a Harper pid file naming a keeper's launcher is the guard's own for that moment, and stays", () =>
 	withTempDir('dd-hpid-', (root) =>
 		withSpawn(async ({ spawn }) => {
 			// Harper records the launcher under the process's name until the launcher exits, a moment later.
-			const standIn = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1 << 30)', KEEPER_SCRIPT, '--launch'], {
-				stdio: 'ignore',
-			});
-			await waitFor(() => argvOf(pidOf(standIn)) !== null, 'the launcher to appear in the process table');
+			const lock = path.join(root, 'locks', 'datadog-agent.pid');
+			const standIn = await keeperStandIn(spawn, '--launch', lock);
 			write(root, 'datadog-agent', pidOf(standIn));
 			const lines = await captureLogs(() =>
-				clearStaleHostPidFiles(root, [{ name: 'datadog-agent', argv: ['/opt/dd/bin/agent', 'run'] }], console)
+				clearStaleHostPidFiles(root, [{ name: 'datadog-agent', argv: ['/opt/dd/bin/agent', 'run'], lock }], console)
 			);
 			assert.equal(fs.existsSync(pidFile(root, 'datadog-agent')), true, "the launcher's file was removed");
 			assert.deepEqual(lines, []);
+		})
+	));
+
+test("NEGATIVE: a Harper pid file naming another name's keeper is removed, the reaper's and a process's alike", () =>
+	withTempDir('dd-hpid-', (root) =>
+		withSpawn(async ({ spawn }) => {
+			// A restart let the agent's keeper take the pid Harper had recorded for the reaper and the trace agent.
+			const locks = path.join(root, 'locks');
+			const standIn = await keeperStandIn(spawn, '--keep', path.join(locks, 'datadog-agent.pid'));
+			write(root, 'datadog-agent-reaper', pidOf(standIn));
+			write(root, 'datadog-trace-agent', pidOf(standIn));
+			const lines = await captureLogs(() =>
+				clearStaleHostPidFiles(
+					root,
+					[
+						{ name: 'datadog-agent-reaper', script: '/reaper.js', lock: path.join(locks, 'datadog-agent-reaper.pid') },
+						{
+							name: 'datadog-trace-agent',
+							argv: ['/opt/dd/bin/trace-agent', 'run'],
+							lock: path.join(locks, 'datadog-trace-agent.pid'),
+						},
+					],
+					console
+				)
+			);
+			assert.equal(fs.existsSync(pidFile(root, 'datadog-agent-reaper')), false, "the reaper's file survived");
+			assert.equal(fs.existsSync(pidFile(root, 'datadog-trace-agent')), false, "the trace agent's file survived");
+			assert.equal(lines.filter((line) => line.includes('removed')).length, 2);
+		})
+	));
+
+test("NEGATIVE: a reaper whose Harper pid file names another name's keeper is started, not refused as handed back", () =>
+	withTempDir('dd-hpid-', (root) =>
+		withSpawn(async ({ spawn, children }) => {
+			const pidDir = path.join(root, 'locks');
+			fs.mkdirSync(pidDir, { recursive: true });
+			// What the soak's leg had: the reaper once ran as a pid that an agent's keeper held after a restart.
+			const standIn = await keeperStandIn(spawn, '--keep', path.join(pidDir, 'datadog-agent.pid'));
+			write(root, 'datadog-agent-reaper', pidOf(standIn));
+			const supervisor = supervisorFor(
+				{},
+				{ log: silent, spawn: harperSpawn(root, spawn), reaperName: 'datadog-agent-reaper' }
+			);
+			const result = await supervisor.start([], { root, pidDir, fingerprintParts: ['pid-reuse'] });
+			const reaper = /** @type {any} */ (result.reaper);
+			try {
+				assert.equal(reaper?.started, true, `the reaper did not start: ${reaper?.error}`);
+				assert.notEqual(reaper.pid, pidOf(standIn), "the keeper's pid was taken for the reaper");
+				assert.ok(argvOf(reaper.pid)?.join(' ').includes('reaper.js'), 'the reaper pid is not running reaper.js');
+				assert.equal(Number(fs.readFileSync(pidFile(root, 'datadog-agent-reaper'), 'utf-8')), reaper.pid);
+			} finally {
+				for (const child of children) if (child.pid) child.kill('SIGKILL');
+			}
 		})
 	));
 
@@ -90,6 +172,37 @@ test('a reaper file naming a live pid that is not running reaper.js is removed',
 		assert.equal(fs.existsSync(pidFile(root, 'datadog-agent-reaper')), false);
 		assert.equal(lines.length, 1);
 	}));
+
+test("a reaper file naming this name's reaper stays, and one naming another name's reaper is removed", () =>
+	withTempDir('dd-hpid-', (root) =>
+		withSpawn(async ({ spawn }) => {
+			const locks = path.join(root, 'locks');
+			const reaperOf = async (/** @type {string} */ name) => {
+				const lock = path.join(locks, `${name}.pid`);
+				const args = ['-e', 'setInterval(() => {}, 1 << 30)', '/x/src/reaper.js', '--self-lock', lock];
+				const standIn = spawn(process.execPath, args, { stdio: 'ignore' });
+				await waitFor(() => argvOf(pidOf(standIn)) !== null, 'the stand-in to appear in the process table');
+				write(root, name, pidOf(standIn));
+				return lock;
+			};
+			const own = await reaperOf('datadog-agent-reaper');
+			await reaperOf('other-reaper');
+			// The other component's file, asked about under this component's lock, as a pid reused across names would be.
+			const lines = await captureLogs(() =>
+				clearStaleHostPidFiles(
+					root,
+					[
+						{ name: 'datadog-agent-reaper', script: '/reaper.js', lock: own },
+						{ name: 'other-reaper', script: '/reaper.js', lock: own },
+					],
+					console
+				)
+			);
+			assert.equal(fs.existsSync(pidFile(root, 'datadog-agent-reaper')), true, "this name's reaper lost its file");
+			assert.equal(fs.existsSync(pidFile(root, 'other-reaper')), false, "another name's reaper kept the file");
+			assert.equal(lines.length, 1);
+		})
+	));
 
 test('no root, nothing to clear', async () => {
 	const lines = await captureLogs(() => clearStaleHostPidFiles(null, [{ name: 'x', argv: ['y'] }], console));
