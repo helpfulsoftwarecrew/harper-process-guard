@@ -29,6 +29,7 @@ import {
 	skipOnWindows,
 	slow,
 	tuning,
+	UNISSUED_PID,
 	waitFor,
 	withSpawn,
 	withTempDir,
@@ -842,17 +843,19 @@ test('a lock naming a dead pid whose keeper still runs is waited on, because tha
 			const keeper = spawn(process.execPath, keeperArgv.slice(1), { stdio: 'ignore' });
 			await waitFor(() => argvOf(pidOf(keeper)) !== null, 'the keeper to appear in the process table');
 			const file = lockPath(dir, 'restarting');
-			seedLock(file, { pid: await deadPid(), argv, keeper: pidOf(keeper), keeperArgv });
+			// Never a recycled pid: one reissued to a stranger reads as a live process running something else, which is taken.
+			seedLock(file, { pid: UNISSUED_PID, argv, keeper: pidOf(keeper), keeperArgv });
 
-			let settled = false;
+			/** @type {string | null} */
+			let settled = null;
 			const claim = claimLock({ pidDir: dir, name: 'restarting', version: 1, argv, timeoutMs: slow(5000) }).then(
 				(result) => {
-					settled = true;
+					settled = result.outcome;
 					return result;
 				}
 			);
 			await settle(200);
-			assert.equal(settled, false, 'a lock its keeper is restarting was taken, which starts a second process');
+			assert.equal(settled, null, `a lock its keeper is restarting was not waited on: the claim ended ${settled}`);
 
 			const replacement = spawn(process.execPath, argv.slice(1), { stdio: 'ignore' });
 			await waitFor(() => argvOf(pidOf(replacement)) !== null, 'the replacement to appear in the process table');

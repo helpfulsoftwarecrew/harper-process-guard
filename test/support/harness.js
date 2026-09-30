@@ -150,6 +150,10 @@ export function settle(ms) {
 	return new Promise((resolve) => setTimeout(resolve, slow(ms)));
 }
 
+/** A pid no platform issues: Linux stays below 2^22, macOS below 100000, and Windows issues multiples of four. For a
+ * lock that must name a dead process for a whole test, since a freed pid can be issued again inside one. */
+export const UNISSUED_PID = 2 ** 22 + 1;
+
 /** A pid nothing holds: a real process, run to completion and reaped, so the number was genuinely issued. */
 export async function deadPid() {
 	const child = realSpawn(process.execPath, ['-e', '0'], { stdio: 'ignore' });
