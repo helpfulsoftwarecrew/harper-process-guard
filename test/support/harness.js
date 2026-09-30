@@ -73,9 +73,9 @@ export async function withTempDir(prefix, run) {
 	try {
 		return await run(dir);
 	} finally {
-		await stopKeepers(dir);
-		// Retried on Windows, where unlink refuses a file another process still holds open: a reaper this
-		// test started may not have closed its log yet.
+		await stopProcessesNaming(dir);
+		// Retried on Windows, where nothing above runs and unlink refuses a file another process still holds
+		// open: a reaper this test started may not have closed its log yet.
 		fs.rmSync(dir, { recursive: true, force: true, maxRetries: WINDOWS ? 10 : 0, retryDelay: 50 });
 	}
 }
@@ -92,27 +92,32 @@ export function processTable() {
 }
 
 /**
- * Every keeper whose lock is under `dir`, and the process each is the parent of, killed. A keeper restarts what a
- * test's own cleanup kills, so it is frozen first and cannot start another between the listing and the kill.
+ * Every process whose command line names `dir`, keepers and reapers alike, and each one's children, killed. All are
+ * frozen first, so none restarts what a test's cleanup killed or writes into `dir` between the listing and the kill.
  *
  * @param {string} dir
  */
-async function stopKeepers(dir) {
+async function stopProcessesNaming(dir) {
 	if (WINDOWS) return;
-	// Only a directory that ever held a lock can have had a keeper, which spares the rest a `ps`.
+	// A keeper or a reaper leaves a lock, a record or a log behind, and a directory with none is spared a `ps`.
 	const entries = fs.readdirSync(dir, { recursive: true }).map(String);
-	if (!entries.some((entry) => entry.endsWith('.pid') || entry.endsWith('.exit'))) return;
+	if (!entries.some((entry) => entry.endsWith('.pid') || entry.endsWith('.exit') || entry.endsWith('.log'))) return;
 	for (let round = 0; round < 5; round++) {
-		const keepers = processTable().filter((row) => row.args.includes(KEEPER_SCRIPT) && row.args.includes(dir));
-		if (keepers.length === 0) return;
-		for (const { pid } of keepers) signalQuietly(pid, 'SIGSTOP');
+		// A reaper appends to its log after it has stopped everything, and that write once landed inside rmSync.
+		const named = processTable().filter((row) => namesDir(row.args, dir) && row.pid !== process.pid);
+		if (named.length === 0) return;
+		for (const { pid } of named) signalQuietly(pid, 'SIGSTOP');
 		await new Promise((resolve) => setTimeout(resolve, 20));
-		const frozen = new Set(keepers.map((row) => row.pid));
+		const frozen = new Set(named.map((row) => row.pid));
 		const children = processTable().filter((row) => frozen.has(row.ppid));
-		for (const { pid } of [...children, ...keepers]) signalQuietly(pid, 'SIGKILL');
+		for (const { pid } of [...children, ...named]) signalQuietly(pid, 'SIGKILL');
 		await new Promise((resolve) => setTimeout(resolve, 50));
 	}
 }
+
+/** Whether a command line names `dir` or a path inside it, and not a sibling that merely starts the same way.
+ * @param {string} args @param {string} dir */
+const namesDir = (args, dir) => args.includes(`${dir}${path.sep}`) || args.includes(`${dir} `) || args.endsWith(dir);
 
 /** @param {number} pid @param {NodeJS.Signals} signal */
 function signalQuietly(pid, signal) {
