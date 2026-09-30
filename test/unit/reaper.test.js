@@ -270,6 +270,33 @@ test('a reaper told to stop exits and writes nothing more when its pid directory
 	);
 });
 
+test('NEGATIVE: a reaper told to stop mid-reap kills the target it had sent SIGTERM and unlocked', (t) => {
+	if (skipOnWindows(t, NO_SIGTERM)) return;
+	return withTempDir('guard-reap-', (dir) =>
+		withSpawn(async ({ spawn }) => {
+			// Ignores SIGTERM, so the reaper is still waiting out its grace on it when it is told to stop.
+			const argv = [process.execPath, fixture('stubborn.js'), `stop-mid-reap-${process.pid}`];
+			const target = spawn(process.execPath, argv.slice(1), { stdio: ['ignore', 'pipe', 'ignore'] });
+			assert.equal(await readyLine(target), 'ready');
+			seedLock(lockPath(dir, 'stubborn'), { pid: pidOf(target), argv });
+			const log = path.join(dir, 'reaper.log');
+			const host = String(await deadPid());
+			const args = [REAPER_SCRIPT, '--host-pid', host, '--pid-dir', dir, '--grace-ms', '0', '--log', log];
+			const reaper = spawn(process.execPath, args, { stdio: 'ignore' });
+			const exited = new Promise((resolve) => reaper.once('exit', resolve));
+			const logged = () => (fs.existsSync(log) ? fs.readFileSync(log, 'utf-8') : '');
+			await waitFor(() => logged().includes('sent SIGTERM'), 'the reaper to signal the target');
+
+			reaper.kill('SIGTERM');
+			await exited;
+			// Well inside the reaper's own 5 s grace: without the kill on its way out, the target outlives it unlocked.
+			await waitFor(() => !isAlive(pidOf(target)), 'the unlocked target to be killed', { timeoutMs: 2000 });
+			assert.equal(fs.existsSync(lockPath(dir, 'stubborn')), false);
+			assert.match(logged(), new RegExp(`sending SIGKILL to ${pidOf(target)}`));
+		})
+	);
+});
+
 test('a reaper told to stop exits at once rather than wait on a gate another process holds', (t) => {
 	if (skipOnWindows(t, NO_SIGTERM)) return;
 	return withTempDir('guard-reap-', (dir) =>

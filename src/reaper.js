@@ -68,6 +68,9 @@ export function collectTargets(options) {
 	return targets;
 }
 
+/** A target this reaper has sent SIGTERM and removed the lock of, until it is seen gone or killed. @type {import('./lock.js').Lock | null} */
+let signalled = null;
+
 /**
  * The lock goes BEFORE the signal: a thread reading a dying pid adopts a corpse and never retries, where
  * one finding nothing starts a replacement.
@@ -92,6 +95,7 @@ export async function reapTarget(options, target) {
 
 	try {
 		process.kill(pid, 'SIGTERM');
+		signalled = removed.held;
 		log(options, `sent SIGTERM to ${pid} (${target.path})`);
 	} catch (error) {
 		log(options, `could not SIGTERM ${pid}: ${errorMessage(error)}`);
@@ -100,6 +104,7 @@ export async function reapTarget(options, target) {
 
 	const grace = options.termGraceMs ?? DEFAULT_TERM_GRACE_MS;
 	await waitWhileAlive(pid, Date.now() + grace, STOP_POLL_MS);
+	signalled = null;
 	if (!isAlive(pid)) return;
 
 	// SIGKILL reaches only a pid identified above; signalling an unnamed one would be this module's own defect.
@@ -199,7 +204,21 @@ export function parseArgs(argv) {
  * @param {ReaperOptions} options @param {NodeJS.Signals} signal
  */
 function stopOnSignal(options, signal) {
-	log(options, `received ${signal}; exiting, and leaving its lock to the next claim.`);
+	// A target already sent SIGTERM has no lock left, so one that ignores it would run on beside the next claim's copy.
+	const target = signalled;
+	let killed = '';
+	if (
+		target &&
+		identifyKept(target.pid, target.argv, target.keeper, target.keeperArgv ?? [], target.started) === 'match'
+	) {
+		try {
+			process.kill(target.pid, 'SIGKILL');
+			killed = `, sending SIGKILL to ${target.pid}, which it had sent SIGTERM and unlocked,`;
+		} catch {
+			// Gone since, which is the outcome asked for.
+		}
+	}
+	log(options, `received ${signal}; exiting${killed} and leaving its lock to the next claim.`);
 	process.exit(0);
 }
 
