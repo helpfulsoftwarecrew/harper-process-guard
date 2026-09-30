@@ -1,7 +1,7 @@
 // @ts-check
 // One winner per node. The lock is only ever REPLACED by rename, never removed then recreated: check-then-delete
 // is two steps, so a second thread can delete the winner's fresh file and both believe they hold it.
-import { linkSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
+import { linkSync, mkdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { threadId } from 'node:worker_threads';
@@ -30,15 +30,15 @@ function gateHoldMs(platform) {
 	return aliveBudgetMs(platform) + identifyKeptBudgetMs(platform);
 }
 
-/** Above the gate hold: a writer that gave up sooner would break a gate a live thread is in, and both would
- * decide one lock. @param {NodeJS.Platform} [platform] @returns {number} */
+/** Above the gate hold, a gate this old is abandoned: one broken sooner can still have a live thread in it, and
+ * both would decide one lock. @param {NodeJS.Platform} [platform] @returns {number} */
 export function gateWaitMs(platform = process.platform) {
 	return gateHoldMs(platform) + 1000;
 }
 const GATE_WAIT_MS = gateWaitMs();
 
-/** A waiter that spends this takes over an unfinished claim, so it outlasts the claimant's longest path to a
- * commit whichever caller claims; test/unit/lock.test.js spells the path out.
+/** An unfinished claim this old is taken over, so it outlasts the claimant's longest path to a commit whichever
+ * caller claims; test/unit/lock.test.js spells the path out.
  * @param {NodeJS.Platform} [platform] @returns {number} */
 export function claimTimeoutMs(platform = process.platform) {
 	const alive = aliveBudgetMs(platform);
@@ -166,21 +166,32 @@ function publish(path, lock, stop) {
 	}
 }
 
+/** How long ago `file` was written, or 0 when it cannot be read: a gate or claim that vanished is no older. @param {string} file */
+function ageOf(file) {
+	try {
+		return Date.now() - statSync(file).mtimeMs;
+	} catch {
+		return 0;
+	}
+}
+
 /**
  * A lock on the lock: while held, one thread decides what happens to `path`. That exclusion turns a read
- * followed by a write into one step.
+ * followed by a write into one step. Returns this holder's mark on the gate, or null when it was not free.
  *
- * @param {string} path @param {boolean} expired Whether the caller's whole budget has run out.
+ * @param {string} path @returns {string | null}
  */
-function takeGate(path, expired) {
+function takeGate(path) {
 	const gate = `${path}${GATE_SUFFIX}`;
 	const temp = `${gate}.${process.pid}.${threadId}.${++serial}`;
+	// The pid first, which is all a waiter reads; the rest tells this holder's gate from the next holder's.
+	const mark = `${process.pid} ${threadId} ${serial} ${Date.now()}`;
 	try {
 		// Written before linking, so the gate names its holder the instant it exists: one empty moment would
 		// read as abandoned to whoever looked.
-		writeFileSync(temp, String(process.pid), 'utf-8');
+		writeFileSync(temp, mark, 'utf-8');
 		linkSync(temp, gate);
-		return true;
+		return mark;
 	} catch (error) {
 		if (errnoCode(error) !== 'EEXIST') throw error;
 	} finally {
@@ -194,11 +205,12 @@ function takeGate(path, expired) {
 	} catch {
 		// Unreadable is "cannot tell", never "not ours": clearing on a failed read takes a gate a second
 		// thread has since linked.
+		return null;
 	}
-	// A gate whose holder is dead is not a gate. `expired` breaks one deliberately, the only remaining path
-	// that can leave two threads inside.
-	if (expired || (holder !== null && !isAlive(holder))) unlinkQuietly(gate);
-	return false;
+	// A gate whose holder is dead is not a gate, and one older than any hold is a holder stuck inside. How long this
+	// caller has waited says nothing: broken on that, a gate another thread had taken half a second before went.
+	if (!isAlive(holder) || ageOf(gate) >= GATE_WAIT_MS) unlinkQuietly(gate);
+	return null;
 }
 
 /**
@@ -206,14 +218,24 @@ function takeGate(path, expired) {
  * null means it was not free.
  *
  * @template T
- * @param {string} path @param {boolean} expired @param {() => T} decide @returns {T | null}
+ * @param {string} path @param {() => T} decide @returns {T | null}
  */
-function underGate(path, expired, decide) {
-	if (!takeGate(path, expired)) return null;
+function underGate(path, decide) {
+	const mark = takeGate(path);
+	if (mark === null) return null;
 	try {
 		return decide();
 	} finally {
-		unlinkQuietly(`${path}${GATE_SUFFIX}`);
+		// Only this holder's own gate: one broken while this holder was stuck is the breaker's now, and removing
+		// it let a third thread in beside the breaker.
+		const gate = `${path}${GATE_SUFFIX}`;
+		let current = null;
+		try {
+			current = readFileSync(gate, 'utf-8');
+		} catch {
+			// Gone already.
+		}
+		if (current === mark) unlinkQuietly(gate);
 	}
 }
 
@@ -236,16 +258,16 @@ function signal(pid) {
  * lock stays in the caller.
  *
  * @param {Lock | null} held
- * @param {{ name: string, version: number, argv: readonly string[], stopOrphans: boolean, expired: boolean, notes: Set<string> }} against
+ * @param {{ name: string, version: number, argv: readonly string[], stopOrphans: boolean, expired: boolean, notes: Set<string>, claimAgeMs: number, timeoutMs: number }} against
  * @returns {{ act: 'take', stop?: number } | { act: 'wait', pollMs?: number } | { act: 'adopt', pid: number }}
  */
-function adjudicate(held, { name, version, argv, stopOrphans, expired, notes }) {
+function adjudicate(held, { name, version, argv, stopOrphans, expired, notes, claimAgeMs, timeoutMs }) {
 	if (!held) return { act: 'take' };
 
 	if (held.pid === 0) {
-		// A claim another thread has not finished. Wait rather than race it; a dead claimant left one nobody
-		// will complete.
-		if (isAlive(held.host) && !expired) return { act: 'wait' };
+		// A claim another thread has not finished. Wait rather than race it until the claim itself is older than the
+		// budget; judged by this caller's wait, one taken over a moment before was taken again and both spawned.
+		if (isAlive(held.host) && claimAgeMs < timeoutMs) return { act: 'wait' };
 		notes.add(`${name}: took over an unfinished claim from pid ${held.host}.`);
 		return { act: 'take' };
 	}
@@ -318,8 +340,10 @@ export async function claimLock({ pidDir, name, version, argv, timeoutMs = CLAIM
 
 	for (;;) {
 		const expired = Date.now() >= deadline;
-		const verdict = underGate(path, expired, () => {
-			const decision = adjudicate(readLock(path), { name, version, argv, stopOrphans, expired, notes });
+		const verdict = underGate(path, () => {
+			const held = readLock(path);
+			const claimAgeMs = held?.pid === 0 ? ageOf(path) : 0;
+			const decision = adjudicate(held, { name, version, argv, stopOrphans, expired, notes, claimAgeMs, timeoutMs });
 			if (decision.act !== 'take') return decision;
 			// Inside the gate, so no sibling reads a dying pid and adopts a corpse. publish signals itself,
 			// which keeps that ahead of the write erasing the pid.
@@ -447,11 +471,10 @@ export async function safeLockWrite(write) {
 
 /** @template T @param {string} path @param {(held: Lock | null) => T} write @returns {Promise<T>} */
 async function writeUnderGate(path, write) {
-	// A gate is held across a liveness check and an identification at worst, so wait that out. The budget
-	// matters only for a thread that died mid-decision.
-	const deadline = Date.now() + GATE_WAIT_MS;
+	// A gate is held across a liveness check and an identification at worst, and one older than that is broken
+	// by takeGate, so this waits on the gate's age rather than keeping a deadline of its own.
 	for (;;) {
-		const done = underGate(path, Date.now() >= deadline, () => write(readLock(path)));
+		const done = underGate(path, () => write(readLock(path)));
 		if (done !== null) return done;
 		await delay(GATE_RETRY_MS);
 	}

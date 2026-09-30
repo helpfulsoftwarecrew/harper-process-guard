@@ -17,6 +17,7 @@ import {
 	lockPath,
 	readLock,
 	releaseLock,
+	removeLock,
 	safeLockWrite,
 	START_FAILURE_MS,
 } from '../../src/lock.js';
@@ -340,12 +341,15 @@ test('an unfinished claim outlives its budget and is taken over, so one wedged t
 	}));
 
 test(
-	'a gate held by a live process is broken once the budget runs out, so a claim cannot wait on it forever',
+	'a gate held by a live process is broken once it is older than any hold, so a claim cannot wait on it forever',
 	{ timeout: slow(5000) },
 	() =>
 		withTempDir('guard-lock-', async (dir) => {
-			// A thread killed inside the gate leaves a holder pid that answers as alive, so only the deadline clears it.
-			fs.writeFileSync(`${lockPath(dir, 'gated')}.claiming`, String(process.pid), 'utf-8');
+			// A thread killed inside the gate leaves a holder pid that answers as alive, so only the gate's age clears it.
+			const gate = `${lockPath(dir, 'gated')}.claiming`;
+			fs.writeFileSync(gate, String(process.pid), 'utf-8');
+			const then = (Date.now() - gateWaitMs() - 1000) / 1000;
+			fs.utimesSync(gate, then, then);
 
 			const started = Date.now();
 			const claim = await claimLock({ pidDir: dir, name: 'gated', version: 1, argv: ['/bin/thing'], timeoutMs: 200 });
@@ -354,6 +358,62 @@ test(
 			assert.equal(fs.existsSync(`${lockPath(dir, 'gated')}.claiming`), false, 'the gate was left behind');
 		})
 );
+
+test('NEGATIVE: a gate a live thread has just taken is not broken by a caller whose own budget has run out', () =>
+	withTempDir('guard-lock-', async (dir) => {
+		// Broken on the caller's wait, a gate another holder had taken half a second before went, and two decided at once.
+		const gate = `${lockPath(dir, 'fresh-gate')}.claiming`;
+		fs.writeFileSync(gate, String(process.pid), 'utf-8');
+		let settled = false;
+		const claim = claimLock({ pidDir: dir, name: 'fresh-gate', version: 1, argv: ['/bin/thing'], timeoutMs: 100 }).then(
+			(result) => {
+				settled = true;
+				return result;
+			}
+		);
+		await settle(500);
+		assert.equal(settled, false, 'a gate a live thread held for half a second was broken by a 100ms budget');
+		assert.equal(fs.existsSync(gate), true, 'the fresh gate was removed');
+		fs.unlinkSync(gate);
+		assert.equal((await claim).outcome, 'won');
+	}));
+
+test("NEGATIVE: a holder whose gate was broken and taken while it was inside leaves the new holder's gate", () =>
+	withTempDir('guard-lock-', async (dir) => {
+		const file = lockPath(dir, 'broken-in');
+		const gate = `${file}.claiming`;
+		seedLock(file, { pid: process.pid, token: 'seeded', argv: ['/bin/thing'] });
+		// What another thread does to a holder stuck past the gate's age: removes its gate and takes one of its own.
+		await removeLock(file, () => {
+			fs.unlinkSync(gate);
+			fs.writeFileSync(gate, `${process.pid} another holder`, 'utf-8');
+			return true;
+		});
+		assert.equal(fs.existsSync(gate), true, 'the stuck holder removed the gate its breaker now holds');
+		assert.equal(fs.readFileSync(gate, 'utf-8'), `${process.pid} another holder`);
+	}));
+
+test('NEGATIVE: a claim taken over a moment ago is waited on by a caller whose budget ends just after, not taken again', () =>
+	withTempDir('guard-lock-', async (dir) =>
+		withSpawn(async ({ spawn }) => {
+			// The caller's own deadline took over a claim another caller had made 2ms before, and both spawned a copy.
+			const argv = [process.execPath, fixture('idle.js'), `taken-over-once-${process.pid}`];
+			const child = spawn(process.execPath, argv.slice(1), { stdio: 'ignore' });
+			await waitFor(() => argvOf(pidOf(child)) !== null, 'the child to appear in the process table');
+			seedLock(lockPath(dir, 'once'), { pid: 0, host: process.pid, token: 'left-by-a-thread', argv });
+			// Each winner names its process 50ms after winning, as a spawn and its commit follow a claim.
+			const claimAndCommit = async (/** @type {number} */ timeoutMs) => {
+				const claim = await claimLock({ pidDir: dir, name: 'once', version: 1, argv, timeoutMs });
+				if (claim.outcome === 'won') {
+					await settle(50);
+					await commitLock(lockPath(dir, 'once'), claim.token, pidOf(child), 1, argv);
+				}
+				return claim.outcome;
+			};
+			const outcomes = await Promise.all([200, 202].map(claimAndCommit));
+			assert.deepEqual(outcomes.sort(), ['adopted', 'won'], `one claim had two winners: ${outcomes.join(', ')}`);
+		})
+	));
 
 test(
 	'a gate whose holder is dead is cleared on the spot, so a claim does not spend its whole budget on it',

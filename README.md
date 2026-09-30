@@ -42,22 +42,22 @@ Any subset of a host's threads may make the call, the main thread among them, an
 - `status.reaper`: whether one runs, under which pid, and why not if not.
 - `status.stop()`: ends this thread's watch, signalling nothing and releasing no lock. Call it on reload. A keeper outlives it: on Linux and macOS a crash after `stop()` is still restarted, and the next `guard()` joins that process, or takes its lock under a new `version`.
 
-| Option           | Default  |                                                                                                  |
-| ---------------- | -------- | ------------------------------------------------------------------------------------------------ |
-| `pidDir`         | required | One `<name>.pid` per process. A directory of the guard's own; the reaper takes every lock in it. |
-| `processes`      | required | `name`, `binaryPath`, `args`, and optionally `title`, `exitHint`, `spawnOptions`, `verify`.      |
-| `spawn`          | required | The caller's own, so a constrained `child_process` can be passed. It also has to run `node`.     |
-| `version`        | `0`      | Fingerprint of whatever forces a replacement. A process under another one is an orphan.          |
-| `stopOrphans`    | `false`  | Whether an identified orphan may be sent SIGTERM.                                                |
-| `log`            | silent   | `info`, `warn`, `error`.                                                                         |
-| `claimTimeoutMs` | `47000`  | How long a claim waits on another thread's unfinished one. `146000` on Windows, as below.        |
-| `reaper`         | none     | `name`, `graceMs` (8000), `replacementPidFile`, `logFile`, `spawnOptions`. No reaper without it. |
+| Option           | Default  |                                                                                                      |
+| ---------------- | -------- | ---------------------------------------------------------------------------------------------------- |
+| `pidDir`         | required | One `<name>.pid` per process. A directory of the guard's own; the reaper takes every lock in it.     |
+| `processes`      | required | `name`, `binaryPath`, `args`, and optionally `title`, `exitHint`, `spawnOptions`, `verify`.          |
+| `spawn`          | required | The caller's own, so a constrained `child_process` can be passed. It also has to run `node`.         |
+| `version`        | `0`      | Fingerprint of whatever forces a replacement. A process under another one is an orphan.              |
+| `stopOrphans`    | `false`  | Whether an identified orphan may be sent SIGTERM.                                                    |
+| `log`            | silent   | `info`, `warn`, `error`.                                                                             |
+| `claimTimeoutMs` | `47000`  | How old another thread's unfinished claim is before it is taken over. `146000` on Windows, as below. |
+| `reaper`         | none     | `name`, `graceMs` (8000), `replacementPidFile`, `logFile`, `spawnOptions`. No reaper without it.     |
 
 `verify` runs once everything is up, reaper included, and its verdict lands on the state. A death that nothing restarts, a deliberate stop among them, drops the verdict again, so a status read reports no proof about a process that has gone.
 
 ## What it does
 
-**One winner.** The lock is `<pidDir>/<name>.pid`: pid, version fingerprint, and the guard's own record. Every decision is taken inside a `<name>.pid.claiming` gate and the file is replaced by `rename`, so a reader never meets a half-written lock. A dead pid is reclaimed. A claim that never finishes inside `claimTimeoutMs` is taken over, which bounds the exclusion rather than making it absolute.
+**One winner.** The lock is `<pidDir>/<name>.pid`: pid, version fingerprint, and the guard's own record. Every decision is taken inside a `<name>.pid.claiming` gate and the file is replaced by `rename`, so a reader never meets a half-written lock. A dead pid is reclaimed. A claim still unfinished once it is `claimTimeoutMs` old is taken over, which bounds the exclusion rather than making it absolute; how long a waiter has waited never breaks a claim or a gate.
 
 **Identity by command line.** The executable resolves to the interpreter for every node script on the box, so identity is the command line: `/proc` on Linux, `ps` on macOS, `Get-CimInstance Win32_Process` on Windows, compared as a leading run of the process's own argv. Nothing is signalled without a positive match, and a thread does not join a process it cannot identify. A process under a keeper also matches when its parent is the keeper its lock names, because a keeper starts nothing but its process and, on macOS, the `ps` reads it waits on; that is how a binary that execs into another command line under the same pid is still recognised. The parent vouches only while it runs the keeper command line the lock records, which names the lock and its token, so a keeper pid the system has handed to another process vouches for nothing. Nor does pid 1, which adopts every orphan. The keeper also records when the process started, and a pid that still started then is that process whatever it runs, since an exec keeps the start time and a process that reuses the pid has its own; that is what identifies it once its keeper is gone.
 

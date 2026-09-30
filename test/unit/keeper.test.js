@@ -714,10 +714,16 @@ test(
 					import('../../src/lock.js'),
 					import('../../src/identity.js'),
 				]);
-				// The thread's wait for its keeper, summed as supervise.js sums it; the commit is held a second past it.
+				// The thread's wait for its keeper, summed as supervise.js sums it; the commit takes the gate half a second
+				// before it runs out and lands a second after, a hold well inside the gate's age limit.
 				const deadline = keeperBootMs() + gateWaitMs() + aliveBudgetMs();
+				const enter = String(Date.now() + deadline - 500);
 				const until = String(Date.now() + deadline + 1000);
-				const env = preloading('held-commit.js', { GUARD_HELD_COMMIT: lock, GUARD_HELD_COMMIT_UNTIL: until });
+				const env = preloading('held-commit.js', {
+					GUARD_HELD_COMMIT: lock,
+					GUARD_HELD_COMMIT_ENTER: enter,
+					GUARD_HELD_COMMIT_UNTIL: until,
+				});
 				const first = keptContext(dir, spawn);
 				const second = keptContext(dir, spawn);
 				try {
