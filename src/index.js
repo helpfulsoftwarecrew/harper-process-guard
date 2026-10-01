@@ -272,15 +272,19 @@ async function awaitLaunch(path, token, launcher) {
 	// Held timers throughout: a host awaiting guard() may have nothing else on its event loop.
 	const deadline = Date.now() + keeperStartMs();
 	for (;;) {
+		// Read before the lock: a launcher commits before it exits, so one seen gone here has left its pid for the read.
+		const over = ended;
 		const held = readLock(path);
 		if (held?.token !== token) return { error: 'its claim was taken over before its launcher named a pid' };
 		if (held.pid > 0) {
 			await reapLauncher();
 			return { pid: held.pid };
 		}
+		// A clean exit with no pid is a launcher that never ran, as reaper.js does when reached through a symlink; waiting
+		// out the start budget for it held guard() for the whole of that budget.
 		const gaveUp =
-			ended !== null && ended !== 'exit code 0'
-				? `its launcher ended with ${ended}`
+			over !== null
+				? `its launcher ended with ${over}${over === 'exit code 0' ? ' and named no pid' : ''}`
 				: Date.now() >= deadline
 					? `its launcher named no pid within ${keeperStartMs()}ms`
 					: null;

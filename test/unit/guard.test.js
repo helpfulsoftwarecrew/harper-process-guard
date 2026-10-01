@@ -10,6 +10,7 @@ import { pathToFileURL } from 'node:url';
 import { fingerprint, guard } from '../../src/index.js';
 import { isAlive } from '../../src/identity.js';
 import { lockPath, readLock } from '../../src/lock.js';
+import { keeperStartMs } from '../../src/supervise.js';
 import {
 	captureLog,
 	countRunning,
@@ -318,6 +319,46 @@ test('NEGATIVE: a reaper launcher that fails gives its claim back and says why, 
 				assert.equal(result.reaper?.started, false, `a failed launch read as a reaper: pid ${result.reaper?.pid}`);
 				assert.match(result.reaper?.error ?? '', /its launcher ended with exit code 2/);
 				assert.equal(calls.length, 1, 'a launcher that ran and failed was run again under the other command');
+				assert.equal(fs.existsSync(lockPath(dir, 'reaper')), false, 'the failed launch left its claim behind');
+			} finally {
+				result.stop();
+			}
+		})
+	);
+});
+
+test('NEGATIVE: a reaper launcher that exits cleanly without naming a pid fails at once, not at the end of the start budget', (t) => {
+	if (skipOnWindows(t, 'no launcher runs on win32, where the reaper is spawned directly and leaves no zombie.')) return;
+	return withTempDir('guard-call-', (dir) =>
+		withSpawn(async ({ spawn, calls }) => {
+			// Reached through a symlink, reaper.js reads its own URL resolved and argv[1] not, so it runs nothing and exits 0.
+			const linked = path.join(dir, 'linked-reaper.js');
+			fs.symlinkSync(REAPER_SCRIPT, linked);
+			const began = Date.now();
+			const result = await guard({
+				pidDir: dir,
+				spawn: (command, args, options) =>
+					spawn(
+						command,
+						args.map((arg) => (arg === REAPER_SCRIPT ? linked : arg)),
+						options
+					),
+				reaper: { name: 'reaper', graceMs: 100 },
+				processes: [],
+			});
+			const tookMs = Date.now() - began;
+			try {
+				assert.equal(
+					result.reaper?.started,
+					false,
+					`a launcher that ran nothing read as a reaper: pid ${result.reaper?.pid}`
+				);
+				assert.match(result.reaper?.error ?? '', /its launcher ended with exit code 0 and named no pid/);
+				assert.ok(
+					tookMs < keeperStartMs() / 2,
+					`guard() waited ${tookMs}ms on a launcher that had already exited (start budget ${keeperStartMs()}ms)`
+				);
+				assert.equal(calls.length, 1, 'a launcher that ran and named no pid was run again under the other command');
 				assert.equal(fs.existsSync(lockPath(dir, 'reaper')), false, 'the failed launch left its claim behind');
 			} finally {
 				result.stop();

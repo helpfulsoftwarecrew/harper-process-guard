@@ -241,8 +241,10 @@ async function launch(argv) {
 	}
 	// Refused here as the reaper would refuse them, before a pid that exits at once is committed as the reaper.
 	refuseNothingToWatch(options);
-	// The script as the thread spelled it, which its claim records: import.meta.url has symlinks resolved, and a lock
-	// naming another path reads the running reaper as an orphan, so the next claim starts a second.
+	// The path the thread passed, which its claim records. The guard at the foot of this file runs launch() only when
+	// argv[1] is this module's own URL, so the two cannot differ here: reached through a symlink, Node resolves
+	// import.meta.url and leaves argv[1] as given, the guard is false and nothing runs, and the thread reads that clean
+	// exit with no pid as a failed launch.
 	const reaperArgv = [process.execPath, process.argv[1] ?? fileURLToPath(import.meta.url), ...flags];
 	// Inherited, so whatever stdio the host gave this launcher is the reaper's.
 	const reaper = spawn(process.execPath, reaperArgv.slice(1), { stdio: 'inherit' });
