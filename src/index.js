@@ -162,8 +162,9 @@ async function launchReaper(ctx, config) {
 		return state;
 	}
 
-	// Through a launcher that exits at once, so init adopts the reaper: one the host spawned itself is reaped only by the
-	// thread that spawned it, and dies a zombie once the host has replaced that thread. Windows leaves no zombie.
+	// Through a launcher that exits at once, so the reaper is reparented to pid 1: one the host spawned itself is reaped
+	// only by the thread that spawned it, and dies a zombie once the host has replaced that thread. That helps only where
+	// pid 1 reaps orphans; a host that is pid 1 itself is left the zombie either way. Windows leaves no zombie.
 	const launching = process.platform !== 'win32';
 	const spawned = launching
 		? [REAPER_SCRIPT, LAUNCH_FLAG, '--token', claim.token, '--version', String(ctx.version), ...args.slice(1)]

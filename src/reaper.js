@@ -228,7 +228,9 @@ function stopOnSignal(options, signal) {
 
 /**
  * Start the reaper, commit its pid on its own lock under the claim's token, and exit, so the thread that spawned this
- * reaps it at once and init adopts the reaper. A reaper the host spawned itself dies a zombie once that thread is gone.
+ * reaps it at once and the reaper is reparented to pid 1. A reaper the host spawned itself dies a zombie once that thread
+ * is gone. Where pid 1 reaps orphans, as tini, launchd and systemd do, a dead reaper is reaped; where the host is pid 1
+ * with no init, it is left a zombie of the host all the same.
  *
  * @param {string[]} argv `--token <token> --version <version>`, then the reaper's own flags.
  */
