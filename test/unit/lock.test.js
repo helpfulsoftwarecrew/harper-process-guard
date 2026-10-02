@@ -467,7 +467,9 @@ test('NEGATIVE: a claim taken over a moment ago is waited on by a caller whose b
 				}
 				return claim.outcome;
 			};
-			const outcomes = await Promise.all([200, 202].map(claimAndCommit));
+			// The budgets scale as the commit's wait does. Unscaled, a Windows commit came 200ms after its claim, past a
+			// 202ms budget, and the second caller took over a claim older than its budget as it should.
+			const outcomes = await Promise.all([slow(200), slow(200) + 2].map(claimAndCommit));
 			assert.deepEqual(outcomes.sort(), ['adopted', 'won'], `one claim had two winners: ${outcomes.join(', ')}`);
 		})
 	));
