@@ -7,13 +7,13 @@ import test from 'node:test';
 
 import { parse } from 'yaml';
 
-import { REPO_ROOT } from '../support/harness.js';
+import { defaultRunners, REPO_ROOT } from '../support/harness.js';
 
 const SRC = path.join(REPO_ROOT, 'src');
 const sources = fs.readdirSync(SRC).filter((file) => file.endsWith('.js'));
 /** @type {{ scripts: Record<string, string>, dependencies?: object, peerDependencies?: object, optionalDependencies?: object, exports: Record<string, string>, files: string[], os?: string[] }} */
 const manifest = JSON.parse(fs.readFileSync(path.join(REPO_ROOT, 'package.json'), 'utf-8'));
-/** @type {{ jobs?: { test?: { strategy?: { matrix?: { os?: string[] } }, steps?: { run?: string }[] } } }} */
+/** @type {{ jobs?: { test?: { strategy?: { matrix?: { os?: unknown } }, steps?: { run?: string }[] } } }} */
 const workflow = parse(fs.readFileSync(path.join(REPO_ROOT, '.github', 'workflows', 'test.yml'), 'utf-8'));
 
 test('what is written is what ships: no build step, and the entry points at the source', () => {
@@ -35,7 +35,8 @@ const PLATFORM_OF = new Map([
 
 test('the platforms the manifest claims are exactly the platforms CI runs', () => {
 	// `os` makes npm refuse the install anywhere else, so a platform claimed and never run is a promise nothing keeps.
-	const runners = workflow.jobs?.test?.strategy?.matrix?.os ?? [];
+	// The full list push and pull_request runs get; publish.yml narrowing it for a tag is publish-workflow.test.js's to check.
+	const runners = defaultRunners(workflow.jobs?.test?.strategy?.matrix?.os);
 	// A matrix that read as empty would let this agree with an `os` field saying anything at all.
 	assert.ok(runners.length > 0, 'test.yml declares no os matrix for the test job');
 

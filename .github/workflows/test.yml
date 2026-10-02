@@ -6,8 +6,14 @@ on:
     branches: ['**']
   pull_request:
   workflow_dispatch:
-  # publish.yml runs this workflow whole as its gate, so the publish path cannot drift onto weaker checks.
+  # publish.yml runs this workflow as its gate, so the publish path cannot drift onto weaker checks; it narrows
+  # only the runners, through `os`.
   workflow_call:
+    inputs:
+      os:
+        description: JSON array of runners for the test matrix; omitted, it is every runner listed at the matrix.
+        type: string
+        required: false
 
 # Nothing here writes with GITHUB_TOKEN; without this line every job takes the repo default, which can be write-all.
 permissions:
@@ -27,7 +33,8 @@ jobs:
       matrix:
         # Exactly the platforms src/identity.js can read a command line on, and the same set package.json's `os` claims.
         # Several cases assert different outcomes per platform, so the divergence is the design rather than flake.
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        # Push, pull_request and workflow_dispatch carry no `os` input, so they always run this full list.
+        os: ${{ fromJSON(inputs.os || '["ubuntu-latest", "macos-latest", "windows-latest"]') }}
         # Harper v5 declares engines.node "^22.18.0 || >=24.0.0", so 22 and 24 are the two versions that exist in the field.
         node: ['22', '24']
     runs-on: ${{ matrix.os }}

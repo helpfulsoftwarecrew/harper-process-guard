@@ -10,13 +10,15 @@ import test from 'node:test';
 
 import { parse } from 'yaml';
 
-import { REPO_ROOT, skipOnWindows } from '../support/harness.js';
+import { defaultRunners, REPO_ROOT, skipOnWindows } from '../support/harness.js';
 
 const WORKFLOW_PATH = path.join(REPO_ROOT, '.github', 'workflows', 'publish.yml');
 const text = fs.readFileSync(WORKFLOW_PATH, 'utf-8');
 /** @typedef {{ name?: string, uses?: string, run?: string, env?: Record<string, string>, with?: Record<string, string> }} Step */
-/** @type {{ jobs: { publish: { permissions?: Record<string, string>, steps: Step[] } } }} */
+/** @type {{ jobs: { test: { uses: string, with?: Record<string, string> }, publish: { needs: string, permissions?: Record<string, string>, steps: Step[] } } }} */
 const workflow = parse(text);
+/** @type {{ jobs: { test: { strategy: { matrix: { os: unknown, node: string[] } } } } }} */
+const testWorkflow = parse(fs.readFileSync(path.join(REPO_ROOT, '.github', 'workflows', 'test.yml'), 'utf-8'));
 const steps = workflow.jobs.publish.steps;
 
 /** @param {string} name @returns {Step} */
@@ -88,6 +90,20 @@ function runStep(name, version, stub) {
 		fs.rmSync(dir, { recursive: true, force: true });
 	}
 }
+
+test('the publish gates on test.yml for Linux and Windows, while test.yml with no input still runs macOS', () => {
+	assert.equal(workflow.jobs.test.uses, './.github/workflows/test.yml');
+	assert.equal(workflow.jobs.publish.needs, 'test');
+	const gated = JSON.parse(workflow.jobs.test.with?.os ?? 'null');
+	assert.deepEqual(gated, ['ubuntu-latest', 'windows-latest'], 'the publish gate runs on other runners than intended');
+	// Push and pull_request runs pass no input, so they run the fallback list, macOS among it.
+	assert.deepEqual(defaultRunners(testWorkflow.jobs.test.strategy.matrix.os), [
+		'ubuntu-latest',
+		'macos-latest',
+		'windows-latest',
+	]);
+	assert.deepEqual(testWorkflow.jobs.test.strategy.matrix.node, ['22', '24'], 'the publish gate lost a node version');
+});
 
 test('publishing authenticates through OIDC alone: no npm token is wired into the job', () => {
 	assert.equal(workflow.jobs.publish.permissions?.['id-token'], 'write', 'the OIDC exchange needs id-token: write');

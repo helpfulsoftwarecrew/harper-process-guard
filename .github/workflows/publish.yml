@@ -17,9 +17,13 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  # The same workflow that gates every branch push, called whole, so a tag cannot publish on weaker checks than a PR merges on.
+  # The same workflow that gates every branch push, so a tag cannot publish on weaker checks than a PR merges on.
+  # macOS is left out: GitHub's hosted macOS runners went unscheduled for hours and cancelled release runs, so the
+  # macOS suite runs on a local Mac before each tag instead. Every node version and the workflow lint still gate.
   test:
     uses: ./.github/workflows/test.yml
+    with:
+      os: '["ubuntu-latest", "windows-latest"]'
 
   publish:
     needs: test

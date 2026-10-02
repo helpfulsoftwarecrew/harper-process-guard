@@ -14,6 +14,19 @@ const FIXTURES = path.join(REPO_ROOT, 'test', 'fixtures');
 /** A path rather than an import, so this harness also loads against a source tree that has no keeper. */
 export const KEEPER_SCRIPT = path.join(REPO_ROOT, 'src', 'keeper.js');
 
+/**
+ * The runners test.yml's matrix falls back to when no `os` input is given, as push and pull_request runs are.
+ * Throws when the matrix is no longer an input with a literal fallback, so a reshaped matrix is not read as empty.
+ *
+ * @param {unknown} expression test.yml's `jobs.test.strategy.matrix.os`
+ * @returns {string[]}
+ */
+export function defaultRunners(expression) {
+	const fallback = /^\$\{\{ fromJSON\(inputs\.os \|\| '(\[.*\])'\) \}\}$/.exec(String(expression));
+	if (!fallback?.[1]) throw new Error(`test.yml's os matrix is no longer an input with a fallback: ${expression}`);
+	return JSON.parse(fallback[1]);
+}
+
 /** @param {string} name @returns {string} */
 export const fixture = (name) => path.join(FIXTURES, name);
 
