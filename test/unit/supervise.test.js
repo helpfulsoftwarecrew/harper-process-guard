@@ -335,6 +335,40 @@ test('a deliberate exit whose lock is already gone is a shutdown, not a handover
 		})
 	));
 
+// A loaded host can show Node's own child gone well before libuv's 'exit' names its code: 632ms behind a 20ms poll
+// on two loaded cores. Holding 'exit' back on a real ChildProcess arranges that order every time.
+test("a clean exit the poll sees before Node's 'exit' is still a shutdown, not a crash", () =>
+	withTempDir('guard-sup-', (dir) =>
+		withSpawn(async ({ spawn, calls }) => {
+			const exitHeldMs = 400;
+			/** @type {import('../../src/supervise.js').Spawn} */
+			const lateExitSpawn = (command, args, options) => {
+				const child = spawn(command, args, options);
+				const emit = child.emit.bind(child);
+				/** @param {string | symbol} event @param {any[]} rest */
+				child.emit = (event, ...rest) => {
+					if (event !== 'exit') return emit(event, ...rest);
+					setTimeout(() => emit(event, ...rest), slow(exitHeldMs));
+					return true;
+				};
+				return child;
+			};
+			const ctx = context(dir, lateExitSpawn);
+			try {
+				const state = await superviseProcess(ctx, descriptorFor('late-exit', 'quits.js', ['0', '20']));
+				assert.equal(state.started, true);
+				await waitFor(() => state.exited, 'the clean exit');
+				await settle(exitHeldMs + 150);
+
+				assert.match(ctx.log.lines.info.join('\n'), /was shut down \(exit code 0\); not restarting it/);
+				assert.equal(calls.length, 1, 'a clean exit the poll saw first was restarted as a crash');
+				assert.equal(fs.existsSync(lockPath(dir, 'late-exit')), false, 'the lock outlived a deliberate shutdown');
+			} finally {
+				ctx.run.stopping = true;
+			}
+		})
+	));
+
 test('a lock-write failure while answering a deliberate exit is reported, never an unhandled rejection', (t) => {
 	if (
 		skipOnWindows(

@@ -100,6 +100,8 @@ const KEEPER_COMMANDS = [process.execPath, 'node'];
 const KEEPER_WATCH_MS = 10;
 /** How often a thread waiting for a keeper's record checks the keeper is still there to write one. */
 const KEEPER_ALIVE_MS = 250;
+/** How long a poll that found Node's own child dead waits for the 'exit' that names its code. */
+const OWN_EXIT_GRACE_MS = 5000;
 /** Two node starts and a start-time read, then the keeper's own commit waiting out the gate. A reaper's launcher needs less. */
 export const keeperStartMs = () => keeperBootMs() + gateWaitMs() + aliveBudgetMs();
 
@@ -162,9 +164,11 @@ function after(ms, value, hold = false) {
 /** @param {Context} ctx @param {SpawnedChild} child @param {number} pid A pid that names a running process; a start without one never reaches here. @returns {Promise<string>} */
 function watchProcess(ctx, child, pid) {
 	const event = typeof child?.on === 'function' ? watchChild(child) : null;
-	const backstop = watchPid(ctx, pid).then((reason) =>
-		event ? Promise.race([event, after(ctx.tuning.deathPollMs, reason)]) : reason
-	);
+	// Node's own child is reaped by libuv, which always emits 'exit', but a loaded host can read the zombie well before
+	// that: 632ms behind a 20ms poll on two loaded cores. Only a host's wrapper gets the poll's own cadence.
+	const grace =
+		typeof child?.spawnfile === 'string' ? Math.max(ctx.tuning.deathPollMs, OWN_EXIT_GRACE_MS) : ctx.tuning.deathPollMs;
+	const backstop = watchPid(ctx, pid).then((reason) => (event ? Promise.race([event, after(grace, reason)]) : reason));
 	return event ? Promise.race([event, backstop]) : backstop;
 }
 
