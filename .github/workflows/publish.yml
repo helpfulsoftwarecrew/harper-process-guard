@@ -28,8 +28,8 @@ jobs:
     timeout-minutes: 15
     permissions:
       contents: read
-      # NPM_TOKEN creates a name on its first publish and writes dist-tags. Once a trusted publisher names
-      # this workflow, npm exchanges this OIDC token first, and provenance is signed from it either way.
+      # npm's trusted publishing exchanges this OIDC token for a credential that can publish and nothing else,
+      # and provenance is signed from it. No npm token reaches this job.
       id-token: write
     steps:
       - name: Checkout
@@ -40,7 +40,8 @@ jobs:
         with:
           node-version: '24'
           cache: 'npm'
-          registry-url: 'https://registry.npmjs.org'
+          # No registry-url: it writes an .npmrc that reads NODE_AUTH_TOKEN and sets a placeholder token when none
+          # is given, and the OIDC exchange needs neither. npm's default registry is the one this publishes to.
 
       - name: Install dependencies
         run: npm ci
@@ -68,28 +69,65 @@ jobs:
             }
           '
 
-      # npm refuses a prerelease without an explicit --tag, so a prerelease goes under `next` and `latest` stays
-      # stable. A bare numbered prerelease is what `npm version prerelease` writes without --preid, so it is refused.
-      - name: Derive the dist-tag from the version
-        id: dist
+      # Only stable versions ship; a version that carries a prerelease suffix is refused before anything is published.
+      - name: Refuse a prerelease version
         run: |
           node -e '
             const { version } = JSON.parse(require("node:fs").readFileSync("package.json", "utf8"));
-            const identifier = version.split("-")[1]?.split(".")[0];
-            if (identifier !== undefined && !/^[a-zA-Z][a-zA-Z0-9-]*$/.test(identifier)) {
-              console.log(`::error::Version ${version} has the numbered prerelease "${identifier}", which is what npm version prerelease writes without --preid. Name the prerelease (2.0.0-beta.0), then re-tag.`);
+            if (version.includes("-")) {
+              console.log(`::error::Version ${version} is a prerelease, and this package publishes stable versions only. Set a version with no "-" suffix in package.json, then re-tag.`);
               process.exit(1);
             }
-            const tag = identifier === undefined ? "latest" : "next";
-            require("node:fs").appendFileSync(process.env.GITHUB_OUTPUT, `tag=${tag}\n`);
-            console.log(`Publishing ${version} under the ${tag} dist-tag.`);
           '
+
+      # npm publishes through OIDC from 11.5.1 on; an older one finds no token and fails as ENEEDAUTH, which reads as a
+      # registry fault rather than a version to bump.
+      - name: Refuse an npm too old for trusted publishing
+        run: |
+          required=11.5.1
+          have="$(npm --version)"
+          if [ "$(printf '%s\n%s\n' "$required" "$have" | sort -V | head -1)" != "$required" ]; then
+            echo "::error::npm $have cannot publish through OIDC trusted publishing, which needs $required or later. Raise the node-version this job sets up."
+            exit 1
+          fi
+
+      # The dist-tag is chosen before the publish, since the OIDC credential covers npm publish and not npm dist-tag:
+      # a version newer than the registry's latest, or a package's first, goes under latest, and a patch to an older
+      # line goes under release-<major>.<minor>, which the publish creates or moves. Only a 404 reads as no latest; any
+      # other failure to read it fails the job, so a patch to an old line cannot take latest on a registry hiccup.
+      - name: Choose the dist-tag
+        id: dist
+        run: |
+          name="$(node -p 'require("./package.json").name')"
+          version="$(node -p 'require("./package.json").version')"
+          err="${RUNNER_TEMP:-/tmp}/npm-view-latest.err"
+          if current="$(npm view "$name" dist-tags.latest 2>"$err")"; then
+            :
+          elif grep -q E404 "$err"; then
+            current=''
+          else
+            cat "$err"
+            echo "::error::The latest dist-tag of $name could not be read, so no dist-tag can be chosen for $version. Re-run the job."
+            exit 1
+          fi
+          # sort -V ranks 2.0.0-beta.1 above 2.0.0, so it only ever compares two stable versions here; a latest that
+          # names a prerelease is one a stable version replaces.
+          tag=latest
+          case "$current" in
+            '' | *-*) ;;
+            *)
+              if [ "$current" != "$version" ] && [ "$(printf '%s\n%s\n' "$current" "$version" | sort -V | tail -1)" = "$current" ]; then
+                tag="release-$(printf '%s' "$version" | cut -d. -f1,2)"
+              fi
+              ;;
+          esac
+          echo "tag=$tag" >>"$GITHUB_OUTPUT"
+          echo "Publishing $name@$version under the $tag dist-tag; the registry's latest is ${current:-unset}."
 
       # A version already on the registry is skipped. `npm view` reads the packument, which can trail a publish
       # by more than 20 minutes, so a re-run inside that window can still fail and a later one finishes.
       - name: Publish to npm
         env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
           NPM_CONFIG_PROVENANCE: 'true'
           DIST_TAG: ${{ steps.dist.outputs.tag }}
         run: |
@@ -100,36 +138,3 @@ jobs:
             exit 0
           fi
           npm publish --access public --tag "$DIST_TAG"
-
-      # npm sets `latest` on a first publish whatever --tag said, so this moves it to a stable release, forward
-      # only. A token writes it, because the OIDC exchange covers publish and not dist-tag add.
-      - name: Point latest at this release
-        if: steps.dist.outputs.tag == 'latest'
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: |
-          set -o pipefail
-          name="$(node -p 'require("./package.json").name')"
-          version="$(node -p 'require("./package.json").version')"
-          current="$(npm view "$name" dist-tags.latest 2>/dev/null || true)"
-          if [ "$current" = "$version" ]; then
-            echo "latest already names $version for $name"
-            exit 0
-          fi
-          # sort -V ranks 2.0.0-beta.1 above 2.0.0, so it only ever compares two stable versions here.
-          case "$current" in
-            '' | *-*) ;;
-            *)
-              if [ "$(printf '%s\n%s\n' "$current" "$version" | sort -V | tail -1)" = "$current" ]; then
-                echo "Leaving $name at latest=$current, which is newer than $version"
-                exit 0
-              fi
-              ;;
-          esac
-          if npm dist-tag add "$name@$version" latest; then
-            echo "latest -> $version for $name"
-          else
-            echo "::error::latest was not moved. The release itself published; only the tag is stale. Run this with a token that can write dist-tags:"
-            echo "  npm dist-tag add $name@$version latest"
-            exit 1
-          fi
