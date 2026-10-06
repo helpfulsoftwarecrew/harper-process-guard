@@ -74,6 +74,8 @@ export function watchForNeverCalled({ log, label, configEntry, deadlineMs = STAR
 /**
  * The plugin entry, once per worker thread. A validation load starts nothing, or every `harper deploy`
  * re-enters the spawn path against a live node; a second call joins the first promise rather than starting.
+ * Harper through 5.3 marks a deploy's validation load with `scope.isTransientValidation`; Harper's main
+ * branch runs no validation load and sets no such flag (harperfast/harper 81ed6643c), so there the check never fires.
  *
  * @param {object} options
  * @param {(scope?: any) => Promise<object>} options.start
@@ -84,6 +86,7 @@ export function createHandleApplication({ start, deadline, slot }) {
 	return function handleApplication(/** @type {any} */ scope) {
 		// Being called at all disarms the deadline; a validation load counts, Harper reached the plugin.
 		deadline.seen();
+		// Kept for the released Harper lines that still run a validation load; a no-op from Harper main onward.
 		if (scope?.isTransientValidation) return;
 		if (!slot.get()) slot.set(start(scope));
 	};

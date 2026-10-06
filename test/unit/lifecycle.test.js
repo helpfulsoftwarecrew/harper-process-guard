@@ -81,8 +81,9 @@ test('the plugin starts once per thread however many times Harper calls it', () 
 	assert.ok(slot.read(), 'the promise is kept so the read path sees the same one');
 });
 
-// A deploy pre-flight loads the component against a live node purely to validate it. Starting there
-// re-enters the sweep and spawn path on every `harper deploy`.
+// Harper through 5.3 loads the component against a live node purely to validate a deploy, and marks
+// that scope `isTransientValidation`. Starting there re-enters the sweep and spawn path on every
+// `harper deploy`. Harper's main branch dropped the validation load (81ed6643c); the released lines still run it.
 test('NEGATIVE: a transient validation load starts nothing', () => {
 	let starts = 0;
 	const slot = slotFor();
